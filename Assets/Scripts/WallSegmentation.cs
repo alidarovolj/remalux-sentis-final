@@ -330,10 +330,8 @@ public class WallSegmentation : MonoBehaviour
     private bool isModelInitialized = false; // Флаг, что модель успешно инициализирована
     private bool isInitializing = false;     // Флаг, что идет процесс инициализации модели
     private string lastErrorMessage = null;  // Последнее сообщение об ошибке при инициализации
-    private bool isProcessingFrame = false; // Флаг, что кадр в данный момент обрабатывается
-    // private bool isInitializationFailed = false; // Флаг, что инициализация модели провалилась. THIS IS USED. // CS0414 - Value is assigned but never used
-    // private int consecutiveFailCount = 0; // Закомментировано из-за CS0414
-    // private bool usingSimulatedSegmentation = false; // Закомментировано из-за CS0414
+    // private bool isProcessingFrame = false; // ФлаГ, ЧТО КАДР В ДАННЫЙ МОМЕНТ ОБРАБАТЫВАЕТСЯ - CS0414 - REMOVING FIELD
+    private ComputeShader maskAnalysisShader;
 
     [System.NonSerialized]
     private int sentisModelWidth = 512; // Значения по умолчанию, обновятся из модели
@@ -701,7 +699,7 @@ public class WallSegmentation : MonoBehaviour
     private const int CAMERA_FRAME_SKIP_COUNT = 2; // Пропускать 2 из 3 кадров для ~20 FPS на 60 FPS камере, если maxSegmentationFPS ~20
 
     private Coroutine processingCoroutine = null;
-    private bool processingCoroutineActive = false; // Added declaration
+    // private bool processingCoroutineActive = false; // CS0414 - REMOVING FIELD
     private RenderTexture tempOutputMask; // Declare tempOutputMask here
 
     private void Awake()
@@ -1744,70 +1742,65 @@ public class WallSegmentation : MonoBehaviour
         if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
             Log("[ProcessCameraFrameCoroutine] Начало обработки кадра.", DebugFlags.ExecutionFlow);
 
-        // processingCoroutineActive = true; // CS0414 - Removed assignment
-        // isProcessingFrame = true; // Устанавливаем флаг в начале корутины // CS0414 - Removed assignment
-
-        Texture2D tempTexture = null; // Declare tempTexture here
+        Texture2D tempTexture = null;
+        XRCpuImage.AsyncConversion request;
 
         cpuImageConversionStopwatch.Restart(); // Start timing XRCpuImage conversion
-
         var conversionParams = new XRCpuImage.ConversionParams
         {
             inputRect = new RectInt(0, 0, cpuImage.width, cpuImage.height),
-            outputDimensions = new Vector2Int(cpuImage.width, cpuImage.height),
-            outputFormat = TextureFormat.RGBA32, // Используем RGBA32 для Texture2D
+            outputDimensions = new Vector2Int(currentResolution.x, currentResolution.y), // NEW CODE: Use target processing resolution
+            outputFormat = TextureFormat.RGBA32,
             transformation = XRCpuImage.Transformation.None
         };
+        request = cpuImage.ConvertAsync(conversionParams);
 
-        var request = cpuImage.ConvertAsync(conversionParams);
-
+        // --- Async wait loop ---
+        // This loop is now OUTSIDE the main try-catch-finally for resource handling, fixing CS1626
         while (!request.status.IsDone())
         {
+#if UNITY_EDITOR
             if (Application.isEditor && !UnityEditor.EditorApplication.isPlaying)
             {
                 Log("[ProcessCameraFrameCoroutine] Редактор вышел из режима воспроизведения во время асинхронной конвертации.", DebugFlags.ExecutionFlow, LogLevel.Warning);
-                cpuImage.Dispose();
-                // processingCoroutineActive = false; // CS0414 - Removed assignment
-                // isProcessingFrame = false; // CS0414 - Removed assignment
-                // Если конвертация прервана, и tempTexture была создана ранее, ее нужно освободить, т.к. RunInference не будет вызван
-                if (tempTexture != null)
+                cpuImage.Dispose(); // Dispose immediately as we are exiting this coroutine path
+                if (tempTexture != null) // Should be null here, but as a safeguard
                 {
                     texture2DPool.ReleaseTexture(tempTexture);
-                    Log("[ProcessCameraFrameCoroutine] tempTexture освобождена (конвертация прервана).", DebugFlags.CameraTexture);
-                    tempTexture = null;
+                    Log("[ProcessCameraFrameCoroutine] tempTexture освобождена (конвертация прервана выходом из Play Mode).", DebugFlags.CameraTexture);
                 }
-                yield break;
+                processingCoroutine = null; // Reset coroutine flag
+                yield break; // Exit coroutine
             }
-            yield return null;
+#endif
+            yield return null; // Valid yield here
         }
+        // --- End of async wait loop ---
 
-        cpuImageConversionStopwatch.Stop(); // Stop timing XRCpuImage conversion
+        cpuImageConversionStopwatch.Stop();
         if ((debugFlags & DebugFlags.Performance) != 0)
         {
             Log($"[PERF] XRCpuImage.ConvertAsync: {cpuImageConversionStopwatch.Elapsed.TotalMilliseconds:F2}ms (Width: {cpuImage.width}, Height: {cpuImage.height})", DebugFlags.Performance);
         }
 
+        bool cpuImageDisposedInTryBlock = false;
 
-        if (request.status == XRCpuImage.AsyncConversionStatus.Ready)
+        try
         {
-            // Копируем данные в tempTexture, которую затем используем для RunInferenceAndPostProcess
-            // Вместо прямого использования cameraTexture, чтобы не менять её размеры здесь
-            // tempTexture будет передана в RunInferenceAndPostProcess
-
-            // Инициализация tempTexture, если она еще не создана или размеры не совпадают
-            // Используем текущие размеры cpuImage, так как это источник данных
-            if (tempTexture == null || tempTexture.width != cpuImage.width || tempTexture.height != cpuImage.height)
+            if (request.status == XRCpuImage.AsyncConversionStatus.Ready)
             {
-                if (tempTexture != null) texture2DPool.ReleaseTexture(tempTexture);
-                tempTexture = texture2DPool.GetTexture(cpuImage.width, cpuImage.height, TextureFormat.RGBA32);
-                tempTexture.name = "WallSegmentation_CpuImageConvResult";
-                if ((debugFlags & DebugFlags.CameraTexture) != 0)
-                    Log($"[ProcessCameraFrameCoroutine] Создана/пересоздана tempTexture ({cpuImage.width}x{cpuImage.height}) для конвертации.", DebugFlags.CameraTexture);
-            }
+                if (tempTexture == null || tempTexture.width != currentResolution.x || tempTexture.height != currentResolution.y) // UPDATED: Check against currentResolution
+                {
+                    if (tempTexture != null) texture2DPool.ReleaseTexture(tempTexture);
+                    tempTexture = texture2DPool.GetTexture(currentResolution.x, currentResolution.y, TextureFormat.RGBA32); // UPDATED: Use currentResolution
+                    tempTexture.name = "WallSegmentation_CpuImageConvResult";
+                    if ((debugFlags & DebugFlags.CameraTexture) != 0)
+                        Log($"[ProcessCameraFrameCoroutine] Создана/пересоздана tempTexture ({currentResolution.x}x{currentResolution.y}) для конвертации.", DebugFlags.CameraTexture);
+                }
 
-            var rawTextureData = request.GetData<byte>();
-            try
-            {
+                var rawTextureData = request.GetData<byte>();
+                // Assuming rawTextureData does not need its own try-finally for Dispose if XRCpuImage.Dispose() covers it.
+                // ARFoundation documentation suggests XRCpuImage.Dispose() handles underlying native resources.
                 if (rawTextureData.IsCreated && rawTextureData.Length > 0)
                 {
                     tempTexture.LoadRawTextureData(rawTextureData);
@@ -1815,47 +1808,75 @@ public class WallSegmentation : MonoBehaviour
                     if ((debugFlags & DebugFlags.CameraTexture) != 0)
                         Log("[ProcessCameraFrameCoroutine] Данные CPU изображения успешно скопированы в tempTexture.", DebugFlags.CameraTexture);
 
-                    // Запускаем основную корутину обработки с полученной tempTexture
-                    // tempTexture НЕ будет освобождаться здесь. RunInferenceAndPostProcess теперь отвечает за это.
-                    // if (processingCoroutine != null) StopCoroutine(processingCoroutine); // Это может быть опасно, если старая корутина еще работает с ресурсами
-                    StartCoroutine(RunInferenceAndPostProcess(tempTexture)); // Просто запускаем новую, isProcessingFrame должен предотвратить гонку
+                    cpuImage.Dispose(); // Dispose XRCpuImage as soon as its data is copied
+                    cpuImageDisposedInTryBlock = true;
+                    if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
+                        Log("[ProcessCameraFrameCoroutine] XRCpuImage disposed (сразу после копирования данных).", DebugFlags.ExecutionFlow);
+
+                    StartCoroutine(RunInferenceAndPostProcess(tempTexture));
+                    tempTexture = null; // Ownership of tempTexture is transferred to RunInferenceAndPostProcess
                 }
                 else
                 {
                     Log("[ProcessCameraFrameCoroutine] Ошибка: rawTextureData не создана или пуста.", DebugFlags.CameraTexture, LogLevel.Error);
-                    // Если данные не удалось загрузить, освобождаем tempTexture здесь, так как она не будет передана
                     if (tempTexture != null)
                     {
                         texture2DPool.ReleaseTexture(tempTexture);
                         Log("[ProcessCameraFrameCoroutine] tempTexture освобождена (rawTextureData пуста).", DebugFlags.CameraTexture);
                         tempTexture = null;
                     }
+                    processingCoroutine = null; // Reset coroutine flag as processing of this frame stops
                 }
             }
-            finally
+            else
             {
-                // rawTextureData.Dispose(); 
+                Log($"[ProcessCameraFrameCoroutine] Ошибка конвертации XRCpuImage: {request.status}", DebugFlags.CameraTexture, LogLevel.Error);
+                if (tempTexture != null)
+                {
+                    texture2DPool.ReleaseTexture(tempTexture);
+                    Log("[ProcessCameraFrameCoroutine] tempTexture была освобождена после ошибки конвертации.", DebugFlags.CameraTexture);
+                    tempTexture = null;
+                }
+                processingCoroutine = null; // Reset coroutine flag
             }
         }
-        else
+        catch (Exception e)
         {
-            Log($"[ProcessCameraFrameCoroutine] Ошибка конвертации XRCpuImage: {request.status}", DebugFlags.CameraTexture, LogLevel.Error);
-            if (tempTexture != null)
+            LogError($"[ProcessCameraFrameCoroutine] Exception: {e.Message}\nStackTrace: {e.StackTrace}", DebugFlags.ExecutionFlow);
+            if (tempTexture != null) // If exception occurred before tempTexture ownership was transferred
             {
-                texture2DPool.ReleaseTexture(tempTexture); // Освобождаем в случае ошибки конвертации
-                Log("[ProcessCameraFrameCoroutine] tempTexture была освобождена через пул после ошибки конвертации.", DebugFlags.TensorProcessing);
+                texture2DPool.ReleaseTexture(tempTexture);
+                LogWarning("[ProcessCameraFrameCoroutine] tempTexture released in catch block due to exception.", DebugFlags.CameraTexture);
                 tempTexture = null;
             }
+            processingCoroutine = null; // Reset coroutine flag on exception
+        }
+        finally
+        {
+            // Fallback disposal for cpuImage if it wasn't disposed successfully in the try block.
+            // XRCpuImage.Dispose() should be idempotent.
+            if (!cpuImageDisposedInTryBlock)
+            {
+                cpuImage.Dispose();
+                if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
+                    Log("[ProcessCameraFrameCoroutine] XRCpuImage disposed in finally block (fallback).", DebugFlags.ExecutionFlow);
+            }
+
+            // If tempTexture still exists here, it means an error occurred before its ownership was transferred
+            // AND it wasn't cleaned up in a more specific error path.
+            if (tempTexture != null)
+            {
+                texture2DPool.ReleaseTexture(tempTexture);
+                if ((debugFlags & DebugFlags.CameraTexture) != 0)
+                    LogWarning("[ProcessCameraFrameCoroutine] tempTexture released in final finally block (unexpected state, error likely occurred before transfer).", DebugFlags.CameraTexture);
+            }
+
+            // processingCoroutine is reset by RunInferenceAndPostProcess on its completion/error,
+            // or in specific error paths within this coroutine if RunInferenceAndPostProcess is not started.
         }
 
-        cpuImage.Dispose();
         if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
-            Log("[ProcessCameraFrameCoroutine] XRCpuImage disposed.", DebugFlags.ExecutionFlow);
-
-        // isProcessingFrame = false; // Сбрасываем флаг в конце корутины, чтобы следующий кадр мог быть обработан // CS0414 - Removed assignment
-        // processingCoroutineActive = false; // CS0414 - Removed assignment
-        if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
-            Log("[ProcessCameraFrameCoroutine] Обработка кадра завершена.", DebugFlags.ExecutionFlow);
+            Log("[ProcessCameraFrameCoroutine] Завершение корутины.", DebugFlags.ExecutionFlow);
     }
 
     private IEnumerator RunInferenceAndPostProcess(Texture2D sourceTextureForInference) // Modified to accept Texture2D
