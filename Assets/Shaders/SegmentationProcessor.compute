@@ -1,0 +1,347 @@
+#pragma kernel ProcessMask
+#pragma kernel AnalyzeQuality
+#pragma kernel TemporalBlend
+#pragma kernel MorphologicalOperation
+#pragma kernel ContrastEnhancement
+#pragma kernel SharpenFilter
+#pragma kernel ComprehensivePostProcess
+
+// Входные и выходные текстуры
+RWTexture2D<float4> InputMask;
+RWTexture2D<float4> PreviousMask;
+RWTexture2D<float4> OutputMask;
+RWTexture2D<float4> MotionVectors;
+RWTexture2D<float4> TempMask1;
+RWTexture2D<float4> TempMask2;
+RWStructuredBuffer<uint> QualityBuffer;
+
+// Параметры для обработки
+float _WallThreshold;
+float _FloorThreshold;
+float _EdgeSoftness;
+float _TemporalWeight;
+float _Sharpness;
+float _EdgeGlow;
+float _MaxDepth;
+float _DepthInfluence;
+
+// Новые параметры для постобработки
+float _ContrastMultiplier;
+float _SharpenStrength;
+int _MorphologyRadius;
+int _MorphologyType; // 0 = Erode, 1 = Dilate, 2 = Opening, 3 = Closing
+float _BlurRadius;
+bool _EnableContrast;
+bool _EnableSharpening;
+bool _EnableMorphology;
+
+// Размеры текстур
+uint _Width;
+uint _Height;
+
+// Вспомогательная функция для применения гауссова размытия
+float4 ApplyGaussianBlur(uint2 id, int radius)
+{
+    float4 sum = float4(0, 0, 0, 0);
+    float weightSum = 0.0;
+    
+    // Двумерное гауссово ядро
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            uint2 samplePos = uint2(
+                min(max(id.x + x, 0), _Width - 1),
+                min(max(id.y + y, 0), _Height - 1)
+            );
+            
+            // Вес пикселя в зависимости от расстояния от центра
+            float weight = exp(-(x*x + y*y) / (2.0 * radius * radius));
+            sum += InputMask[samplePos] * weight;
+            weightSum += weight;
+        }
+    }
+    
+    return sum / weightSum;
+}
+
+// Функция для обнаружения краев
+float3 DetectEdges(uint2 id)
+{
+    float edge = 0.0;
+    
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            if (x == 0 && y == 0) continue;
+            
+            uint2 samplePos = uint2(
+                min(max(id.x + x, 0), _Width - 1),
+                min(max(id.y + y, 0), _Height - 1)
+            );
+            
+            edge += abs(InputMask[id].r - InputMask[samplePos].r);
+        }
+    }
+    
+    return float3(1.0, 1.0, 1.0) * saturate(edge * _EdgeGlow * 8.0);
+}
+
+// Функция для применения временной стабилизации
+float4 ApplyTemporalStabilization(uint2 id)
+{
+    float4 currentValue = InputMask[id];
+    float4 previousValue = PreviousMask[id];
+    float2 motion = MotionVectors[id].xy * 0.05;
+    
+    // Получаем предыдущий пиксель с учетом движения
+    uint2 prevPos = uint2(
+        min(max(id.x - int(motion.x * _Width), 0), _Width - 1),
+        min(max(id.y - int(motion.y * _Height), 0), _Height - 1)
+    );
+    
+    previousValue = PreviousMask[prevPos];
+    
+    // Адаптивный вес в зависимости от величины движения
+    float motionMagnitude = length(motion) * 10.0;
+    float adaptiveWeight = max(0.2, min(0.8, _TemporalWeight * (1.0 - motionMagnitude)));
+    
+    return lerp(currentValue, previousValue, adaptiveWeight);
+}
+
+// Главное ядро обработки маски
+[numthreads(8, 8, 1)]
+void ProcessMask(uint3 id : SV_DispatchThreadID)
+{
+    // Проверка на выход за границы текстуры
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    // Получаем исходные данные (вероятности стены и пола)
+    float wallProb = InputMask[id.xy].r;
+    float floorProb = InputMask[id.xy].g;
+    
+    // Применяем размытие для сглаживания краев
+    float4 blurred = ApplyGaussianBlur(id.xy, int(_EdgeSoftness * 10.0));
+    
+    // Применяем временную стабилизацию
+    float4 stabilized = ApplyTemporalStabilization(id.xy);
+    
+    // Мягкое пороговое значение для стен и пола
+    float wallMask = smoothstep(_WallThreshold - _EdgeSoftness, _WallThreshold + _EdgeSoftness, stabilized.r);
+    float floorMask = smoothstep(_FloorThreshold - _EdgeSoftness, _FloorThreshold + _EdgeSoftness, stabilized.g);
+    
+    // Обнаружение и свечение краев
+    float3 edgeGlow = DetectEdges(id.xy);
+    
+    // Комбинируем результаты
+    float4 result = float4(
+        wallMask, 
+        floorMask,
+        0.0,
+        max(wallMask, floorMask)
+    );
+    
+    // Добавляем свечение краев (если есть)
+    result.rgb += edgeGlow * result.a;
+    
+    // Записываем результат
+    OutputMask[id.xy] = result;
+}
+
+// Ядро для анализа качества маски
+[numthreads(8, 8, 1)]
+void AnalyzeQuality(uint3 id : SV_DispatchThreadID)
+{
+    // Только первый поток инициализирует счетчик
+    if (id.x == 0 && id.y == 0)
+    {
+        QualityBuffer[0] = 0; // Значимые пиксели
+        QualityBuffer[1] = 0; // Общее число проанализированных пикселей
+    }
+    
+    // Синхронизация, чтобы убедиться что инициализация завершена
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Проверка на выход за границы текстуры
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    // Получаем данные пикселя
+    float4 pixel = InputMask[id.xy];
+    
+    // Проверяем, является ли пиксель значимым (выше порога для стены или пола)
+    bool isSignificant = pixel.r > _WallThreshold || pixel.g > _FloorThreshold;
+    
+    // Атомарно увеличиваем счетчики
+    if (isSignificant)
+    {
+        InterlockedAdd(QualityBuffer[0], 1);
+    }
+    
+    InterlockedAdd(QualityBuffer[1], 1);
+}
+
+// Ядро для временной стабилизации между кадрами
+[numthreads(8, 8, 1)]
+void TemporalBlend(uint3 id : SV_DispatchThreadID)
+{
+    // Проверка на выход за границы текстуры
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    // Получаем текущее и предыдущее значения
+    float4 current = InputMask[id.xy];
+    float4 previous = PreviousMask[id.xy];
+    
+    // Применяем адаптивное смешивание
+    float2 motion = MotionVectors[id.xy].xy;
+    float motionMagnitude = length(motion);
+    
+    // Регулируем вес в зависимости от движения: меньше вес для быстрого движения
+    float adaptiveWeight = max(0.1, min(0.9, _TemporalWeight * (1.0 - motionMagnitude * 5.0)));
+    
+    // Плавное смешивание для уменьшения мерцания
+    float4 result = lerp(current, previous, adaptiveWeight);
+    
+    // Записываем результат
+    OutputMask[id.xy] = result;
+}
+
+// Ядро для морфологических операций (Erode/Dilate/Opening/Closing)
+[numthreads(8, 8, 1)]
+void MorphologicalOperation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    float4 centerPixel = InputMask[id.xy];
+    float4 result = centerPixel;
+    
+    if (_MorphologyType == 0) // Erode
+    {
+        float minValue = 1.0;
+        for (int y = -_MorphologyRadius; y <= _MorphologyRadius; y++)
+        {
+            for (int x = -_MorphologyRadius; x <= _MorphologyRadius; x++)
+            {
+                uint2 samplePos = uint2(
+                    clamp(id.x + x, 0, _Width - 1),
+                    clamp(id.y + y, 0, _Height - 1)
+                );
+                minValue = min(minValue, InputMask[samplePos].r);
+            }
+        }
+        result.r = minValue;
+    }
+    else if (_MorphologyType == 1) // Dilate
+    {
+        float maxValue = 0.0;
+        for (int y = -_MorphologyRadius; y <= _MorphologyRadius; y++)
+        {
+            for (int x = -_MorphologyRadius; x <= _MorphologyRadius; x++)
+            {
+                uint2 samplePos = uint2(
+                    clamp(id.x + x, 0, _Width - 1),
+                    clamp(id.y + y, 0, _Height - 1)
+                );
+                maxValue = max(maxValue, InputMask[samplePos].r);
+            }
+        }
+        result.r = maxValue;
+    }
+    // Opening и Closing будут выполнены в несколько проходов
+    
+    OutputMask[id.xy] = result;
+}
+
+// Ядро для повышения контраста
+[numthreads(8, 8, 1)]
+void ContrastEnhancement(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    float4 pixel = InputMask[id.xy];
+    
+    if (_EnableContrast)
+    {
+        // Применяем S-кривую для повышения контраста
+        float enhanced = pow(pixel.r, 1.0 / _ContrastMultiplier);
+        enhanced = saturate((enhanced - 0.5) * _ContrastMultiplier + 0.5);
+        pixel.r = enhanced;
+        
+        // Применяем к другим каналам если нужно
+        if (pixel.g > 0.01) // Floor channel
+        {
+            float enhancedFloor = pow(pixel.g, 1.0 / _ContrastMultiplier);
+            enhancedFloor = saturate((enhancedFloor - 0.5) * _ContrastMultiplier + 0.5);
+            pixel.g = enhancedFloor;
+        }
+    }
+    
+    OutputMask[id.xy] = pixel;
+}
+
+// Ядро для повышения резкости
+[numthreads(8, 8, 1)]
+void SharpenFilter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    float4 centerPixel = InputMask[id.xy];
+    float4 result = centerPixel;
+    
+    if (_EnableSharpening)
+    {
+        // Лапласиан для обнаружения краев
+        float4 laplacian = float4(0, 0, 0, 0);
+        
+        // Простое ядро повышения резкости 3x3
+        laplacian += InputMask[uint2(clamp(id.x-1, 0, _Width-1), clamp(id.y-1, 0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x,   0, _Width-1), clamp(id.y-1, 0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x+1, 0, _Width-1), clamp(id.y-1, 0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x-1, 0, _Width-1), clamp(id.y,   0, _Height-1))] * -1.0;
+        laplacian += centerPixel * 8.0;
+        laplacian += InputMask[uint2(clamp(id.x+1, 0, _Width-1), clamp(id.y,   0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x-1, 0, _Width-1), clamp(id.y+1, 0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x,   0, _Width-1), clamp(id.y+1, 0, _Height-1))] * -1.0;
+        laplacian += InputMask[uint2(clamp(id.x+1, 0, _Width-1), clamp(id.y+1, 0, _Height-1))] * -1.0;
+        
+        result = centerPixel + laplacian * _SharpenStrength;
+        result = saturate(result);
+    }
+    
+    OutputMask[id.xy] = result;
+}
+
+// Комплексное ядро постобработки (все в одном проходе)
+[numthreads(8, 8, 1)]
+void ComprehensivePostProcess(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    
+    float4 pixel = InputMask[id.xy];
+    
+    // 1. Применяем размытие если нужно
+    if (_BlurRadius > 0.5)
+    {
+        pixel = ApplyGaussianBlur(id.xy, int(_BlurRadius));
+    }
+    
+    // 2. Применяем пороговую обработку
+    float wallMask = smoothstep(_WallThreshold - _EdgeSoftness, _WallThreshold + _EdgeSoftness, pixel.r);
+    float floorMask = smoothstep(_FloorThreshold - _EdgeSoftness, _FloorThreshold + _EdgeSoftness, pixel.g);
+    
+    // 3. Повышение контраста
+    if (_EnableContrast)
+    {
+        wallMask = saturate((wallMask - 0.5) * _ContrastMultiplier + 0.5);
+        floorMask = saturate((floorMask - 0.5) * _ContrastMultiplier + 0.5);
+    }
+    
+    // 4. Обнаружение краев и свечение
+    float3 edgeGlow = DetectEdges(id.xy);
+    
+    // 5. Финальная сборка
+    float4 result = float4(wallMask, floorMask, 0.0, max(wallMask, floorMask));
+    result.rgb += edgeGlow * result.a * _EdgeGlow;
+    
+    OutputMask[id.xy] = saturate(result);
+} 
