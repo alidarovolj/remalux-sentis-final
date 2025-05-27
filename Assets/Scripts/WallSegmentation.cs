@@ -1966,34 +1966,92 @@ public class WallSegmentation : MonoBehaviour
 
 
             if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                Log("[WallSegmentation] ПЕРЕД SentisCompat.RenderTensorToTexture.", DebugFlags.TensorProcessing);
+                Log("[WallSegmentation] ПЕРЕД двухэтапным апскейлингом (outputTensor -> lowResMask -> segmentationMaskTexture).", DebugFlags.TensorProcessing);
 
-            tensorRenderStopwatch.Restart();
-            bool renderSuccess = SentisCompat.RenderTensorToTexture(outputTensor, segmentationMaskTexture);
+            // START OF TWO-STEP UPSCALING
+            // outputTensor dimensions are (1, C, 120, 160). For GetTemporary(width, height, ...), it's (160, 120).
+            // Using RenderTextureFormat.R8 as per the ChatGPT example. If issues, consider ARGB32 if all 4 channels are needed.
+            RenderTexture lowResMask = RenderTexture.GetTemporary(160, 120, 0, RenderTextureFormat.R8);
+            lowResMask.enableRandomWrite = false; // As per the ChatGPT example
+            lowResMask.filterMode = FilterMode.Point;    // Point filter for the initial tensor-to-texture render
+
+            // Ensure segmentationMaskTexture (target) has bilinear filtering enabled for the Blit
+            if (segmentationMaskTexture != null)
+            {
+                segmentationMaskTexture.filterMode = FilterMode.Bilinear;
+            }
+            else
+            {
+                LogError("[WallSegmentation] segmentationMaskTexture is null. Cannot perform upscaling.", DebugFlags.TensorProcessing);
+                errorOccurred = true;
+                RenderTexture.ReleaseTemporary(lowResMask);
+                yield break;
+            }
+
+            // Шаг 1: вывести тензор в lowResMask (1:1 без сглаживания)
+            tensorRenderStopwatch.Restart(); // Замеряем SentisCompat.RenderTensorToTexture
+            bool lowResRenderSuccess = SentisCompat.RenderTensorToTexture(outputTensor, lowResMask);
             tensorRenderStopwatch.Stop();
             accumulatedProcessingTimeMs += (float)tensorRenderStopwatch.Elapsed.TotalMilliseconds;
+            if ((debugFlags & DebugFlags.Performance) != 0)
+                Log($"[PERF] Stage 1 (TensorToLowResTexture): {tensorRenderStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+
+
+            bool finalRenderSuccess = false;
+            if (lowResRenderSuccess)
+            {
+                if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
+                    Log("[WallSegmentation] Успешно отрисован тензор в lowResMask.", DebugFlags.TensorProcessing);
+
+                // Шаг 2: билинейно растянуть lowResMask в segmentationMaskTexture
+                // Используем comprehensivePostProcessStopwatch для замера Graphics.Blit
+                comprehensivePostProcessStopwatch.Restart();
+
+                // --- CHANGE TO FIX BLOCKINESS ---
+                FilterMode originalLowResFilterMode = lowResMask.filterMode;
+                if (originalLowResFilterMode != FilterMode.Bilinear)
+                {
+                    lowResMask.filterMode = FilterMode.Bilinear;
+                    if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing && (this.debugFlags & DebugFlags.DetailedTensor) == DebugFlags.DetailedTensor)
+                        Log($"[RunInferenceAndPostProcess] Temporarily changed lowResMask.filterMode to Bilinear for Blit (was {originalLowResFilterMode}).", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
+                }
+                // --- END OF CHANGE ---
+
+                Graphics.Blit(lowResMask, segmentationMaskTexture);
+
+                // --- RESTORE FILTER MODE ---
+                if (lowResMask.filterMode != originalLowResFilterMode) // Check if we actually changed it
+                {
+                    lowResMask.filterMode = originalLowResFilterMode;
+                    if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing && (this.debugFlags & DebugFlags.DetailedTensor) == DebugFlags.DetailedTensor)
+                        Log($"[RunInferenceAndPostProcess] Restored lowResMask.filterMode to {originalLowResFilterMode} after Blit.", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
+                }
+                // --- END OF RESTORE ---
+
+                comprehensivePostProcessStopwatch.Stop();
+                accumulatedProcessingTimeMs += (float)comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds;
+                if ((debugFlags & DebugFlags.Performance) != 0)
+                    Log($"[PERF] Stage 2 (BlitLowResToFinalTexture): {comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+
+                finalRenderSuccess = true; // Assume Blit is successful
+            }
+            else
+            {
+                Log("[WallSegmentation] ОШИБКА рендеринга тензора в lowResMask.", DebugFlags.TensorProcessing, LogLevel.Error);
+            }
+
+            RenderTexture.ReleaseTemporary(lowResMask);
+            // END OF TWO-STEP UPSCALING
+
+            bool renderSuccess = finalRenderSuccess; // Use the success status from the new method
+
+            // tensorRenderStopwatch.Stop(); // Уже остановлен выше для первого этапа
+            // accumulatedProcessingTimeMs += (float)tensorRenderStopwatch.Elapsed.TotalMilliseconds; // Уже добавлено для первого этапа
 
             if (renderSuccess)
             {
                 if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                    Log($"[WallSegmentation] Выходной тензор отрисован в segmentationMaskTexture (renderSuccess = {renderSuccess}).", DebugFlags.TensorProcessing);
-
-                SaveTextureForDebug(segmentationMaskTexture, "DebugMaskOutput_RawSentis.png");
-            }
-            else
-            {
-                Log("[WallSegmentation] ОШИБКА рендеринга тензора в текстуру.", DebugFlags.TensorProcessing, LogLevel.Error);
-            }
-
-            if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                Log("[WallSegmentation] ПОСЛЕ SentisCompat.RenderTensorToTexture.", DebugFlags.TensorProcessing);
-
-            if (renderSuccess)
-            {
-                if ((this.debugFlags & DebugFlags.ExecutionFlow) == DebugFlags.ExecutionFlow)
-                    Log("[WallSegmentation] Начало постобработки.", DebugFlags.ExecutionFlow);
-
-                lastSuccessfulMask = segmentationMaskTexture; // Keep track of the raw mask before post-processing
+                    Log("[WallSegmentation] ПОСЛЕ двухэтапного апскейлинга.", DebugFlags.TensorProcessing);
 
                 if (this.useGPUPostProcessing && this.comprehensivePostProcessMaterial != null && tempMask1 != null && tempMask2 != null)
                 {
