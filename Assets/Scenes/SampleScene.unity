@@ -875,7 +875,7 @@ MonoBehaviour:
   clusteringMinHitsThreshold: 1
   planeConfigurator: {fileID: 1967626624}
   wallSegmentation: {fileID: 1967626620}
-  debugFlags: 2
+  debugFlags: 4
   selectedPlaneMaterial: {fileID: 0}
   paintMaterial: {fileID: 0}
 --- !u!4 &1967626622

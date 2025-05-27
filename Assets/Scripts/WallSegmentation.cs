@@ -707,6 +707,10 @@ public class WallSegmentation : MonoBehaviour
     private RenderTexture tempOutputMask; // Declare tempOutputMask here
     private RenderTexture m_LowResMask; // ADDED: Class field for low-resolution mask
 
+    // --- Constants for default low-resolution mask ---
+    private const int DEFAULT_LOW_RES_WIDTH = 80;
+    private const int DEFAULT_LOW_RES_HEIGHT = 80;
+
     private void Awake()
     {
         Log("[WallSegmentation] Awake_Start", DebugFlags.Initialization);
@@ -991,6 +995,94 @@ public class WallSegmentation : MonoBehaviour
             yield break;
         }
 
+        // Шаг 3.5: Определяем РАЗМЕРЫ ВЫХОДА модели и инициализируем m_LowResMask
+        int modelOutputHeight = DEFAULT_LOW_RES_HEIGHT; // Default
+        int modelOutputWidth = DEFAULT_LOW_RES_WIDTH;   // Default
+
+        try
+        {
+            if (runtimeModel != null && runtimeModel.outputs != null && runtimeModel.outputs.Count > 0)
+            {
+                Unity.Sentis.Model.Output outputInfo = runtimeModel.outputs[0]; // Явно указываем тип
+
+                if (!object.ReferenceEquals(outputInfo, null))
+                {
+                    Log($"[WallSegmentation] Processing model output: {outputInfo.name} (Type: {outputInfo.GetType().FullName})", DebugFlags.Initialization);
+
+                    object shapeObj = null;
+                    System.Reflection.PropertyInfo shapeProperty = outputInfo.GetType().GetProperty("shape");
+
+                    if (shapeProperty != null)
+                    {
+                        shapeObj = shapeProperty.GetValue(outputInfo);
+                    }
+                    else
+                    {
+                        LogWarning($"[WallSegmentation] Could not find 'shape' property via reflection on type {outputInfo.GetType().FullName}. Using default dimensions.", DebugFlags.Initialization);
+                    }
+
+                    if (shapeObj != null && shapeObj is Unity.Sentis.TensorShape tensorShape)
+                    {
+                        int[] dimensions = tensorShape.ToArray();
+                        string dimsString = dimensions != null ? string.Join(", ", dimensions.Select(d => d.ToString())) : "null";
+                        Log($"[WallSegmentation] Raw model output dimensions from shape.ToArray(): [{dimsString}] for output '{outputInfo.name}'", DebugFlags.Initialization);
+
+                        if (dimensions != null && dimensions.Length >= 2)
+                        {
+                            if (dimensions.Length == 4) // NCHW
+                            {
+                                modelOutputHeight = dimensions[2];
+                                modelOutputWidth = dimensions[3];
+                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (предполагаем NCHW {dimensions[2]}x{dimensions[3]}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
+                            }
+                            else if (dimensions.Length == 3)
+                            {
+                                LogWarning($"[WallSegmentation] Не удалось однозначно определить H, W из 3-мерного тензора ({dimsString}). Используем последние два как H,W, но это может быть неверно. Рекомендуется 4D выход NCHW.", DebugFlags.Initialization);
+                                modelOutputHeight = dimensions[dimensions.Length - 2];
+                                modelOutputWidth = dimensions[dimensions.Length - 1];
+                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (из 3D тензора как ..HW {modelOutputHeight}x{modelOutputWidth}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
+                            }
+                            else if (dimensions.Length == 2) // HW
+                            {
+                                modelOutputHeight = dimensions[0];
+                                modelOutputWidth = dimensions[1];
+                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (предполагаем HW {dimensions[0]}x{dimensions[1]}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
+                            }
+                            else
+                            {
+                                LogWarning($"[WallSegmentation] Неожиданное количество измерений ({dimensions.Length}) в output shape: [{dimsString}]. Используем размеры по умолчанию.", DebugFlags.Initialization);
+                            }
+                        }
+                        else
+                        {
+                            LogWarning($"[WallSegmentation] Не удалось получить корректные размеры выхода из shape.ToArray(). Длина массива < 2 или null: [{dimsString}]. Используем размеры по умолчанию.", DebugFlags.Initialization);
+                        }
+                    }
+                    else
+                    {
+                        string shapeErrorDetail = shapeObj == null ? "shape object retrieved via reflection is null" : $"shape object is not a TensorShape (Type: {shapeObj.GetType().FullName})";
+                        LogWarning($"[WallSegmentation] Failed to get valid TensorShape for output '{outputInfo.name}'. Detail: {shapeErrorDetail}. Using default dimensions.", DebugFlags.Initialization);
+                    }
+                }
+                else
+                {
+                    LogWarning("[WallSegmentation] outputInfo (runtimeModel.outputs[0]) is null. Using default dimensions.", DebugFlags.Initialization);
+                }
+            }
+            else
+            {
+                string outputsError = object.ReferenceEquals(runtimeModel, null) ? "runtimeModel is null" : (object.ReferenceEquals(runtimeModel.outputs, null) ? "runtimeModel.outputs is null" : "runtimeModel.outputs is empty");
+                LogWarning($"[WallSegmentation] {outputsError}. Используем размеры по умолчанию.", DebugFlags.Initialization);
+            }
+        }
+        catch (System.Exception e)
+        {
+            LogWarning($"[WallSegmentation] Исключение при определении размеров ВЫХОДА модели: {e.Message}. Трассировка: {e.StackTrace}. Используем размеры по умолчанию.", DebugFlags.Initialization);
+        }
+
+        EnsureLowResMask(modelOutputWidth, modelOutputHeight);
+        Log($"[WallSegmentation] m_LowResMask инициализирован с размерами: {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
+
         // Шаг 4: Определяем размеры входа модели
         try
         {
@@ -1145,10 +1237,10 @@ public class WallSegmentation : MonoBehaviour
     {
         string[] possiblePaths = new string[]
         {
-            Path.Combine(Application.streamingAssetsPath, modelPath),
-            Path.Combine(Application.streamingAssetsPath, "segformer-model.sentis"),
-            Path.Combine(Application.streamingAssetsPath, "model.sentis"),
-            Path.Combine(Application.streamingAssetsPath, "model.onnx")
+                Path.Combine(Application.streamingAssetsPath, modelPath),
+                Path.Combine(Application.streamingAssetsPath, "segformer-model.sentis"),
+                Path.Combine(Application.streamingAssetsPath, "model.sentis"),
+                Path.Combine(Application.streamingAssetsPath, "model.onnx")
         };
 
         foreach (string path in possiblePaths)
@@ -1290,34 +1382,8 @@ public class WallSegmentation : MonoBehaviour
             segmentationMaskTexture.filterMode = FilterMode.Bilinear;
         }
         ClearRenderTexture(segmentationMaskTexture, Color.clear); // Clear after create/property set
-        // TrackResourceCreation was here, moved after ClearRenderTexture if that makes more sense or keep as is.
-        // Debug.Log for segmentationMaskTexture was here
-
-        // Initialize m_LowResMask (now 80x80, matching model output for 320x320 input)
-        int lowResMaskWidth = 80; // From ONNX analysis (output for 320x320 input)
-        int lowResMaskHeight = 80; // From ONNX analysis
-
-        if (m_LowResMask == null || !m_LowResMask.IsCreated() || m_LowResMask.width != lowResMaskWidth || m_LowResMask.height != lowResMaskHeight || m_LowResMask.format != RenderTextureFormat.R8)
-        {
-            if (m_LowResMask != null) { texturePool.ReleaseTexture(m_LowResMask); TrackResourceRelease("m_LowResMask_PreRecreate"); }
-            m_LowResMask = texturePool.GetTexture(lowResMaskWidth, lowResMaskHeight, RenderTextureFormat.R8);
-            m_LowResMask.name = "WallSegmentation_LowResMask_Field";
-            m_LowResMask.enableRandomWrite = false;
-            m_LowResMask.filterMode = FilterMode.Point;
-            if (!m_LowResMask.IsCreated()) { m_LowResMask.Create(); }
-            ClearRenderTexture(m_LowResMask, Color.clear);
-            TrackResourceCreation("m_LowResMask_Field");
-            Log($"[InitializeTextures] Создана/получена m_LowResMask ({lowResMaskWidth}x{lowResMaskHeight}, R8, Point) as class field.", DebugFlags.Initialization);
-        }
-        else // Texture existed, ensure properties are correct (especially if format could change, though less likely for R8)
-        {
-            m_LowResMask.enableRandomWrite = false;
-            m_LowResMask.filterMode = FilterMode.Point;
-            // If format could change for a reused texture, might need to check m_LowResMask.format and re-Get if necessary
-        }
-        // ClearRenderTexture(m_LowResMask, Color.clear); // Already cleared if newly created, ensure it's cleared if reused and dirty.
-        // Ensuring it's cleared once after any potential creation or if it was just fetched and might be dirty.
-        if (m_LowResMask != null && m_LowResMask.IsCreated()) ClearRenderTexture(m_LowResMask, Color.clear);
+                                                                  // TrackResourceCreation was here, moved after ClearRenderTexture if that makes more sense or keep as is.
+                                                                  // Debug.Log for segmentationMaskTexture was here
 
         // Вызываем CreateGPUPostProcessingTextures для инициализации/обновления остальных временных текстур
         CreateGPUPostProcessingTextures(); // This will also use the pool for tempMask1, tempMask2 etc.
@@ -1656,7 +1722,9 @@ public class WallSegmentation : MonoBehaviour
         {
             if (previousMask != null) { texturePool.ReleaseTexture(previousMask); TrackResourceRelease("previousMask_GPU_Disabled"); previousMask = null; }
             if (interpolatedMask != null) { texturePool.ReleaseTexture(interpolatedMask); TrackResourceRelease("interpolatedMask_GPU_Disabled"); interpolatedMask = null; }
+            // Не нужно создавать interpolatedMask здесь, если интерполяция выключена
         }
+        // Удален лишний блок else, который был здесь
     }
 
     /// <summary>
@@ -1828,11 +1896,20 @@ public class WallSegmentation : MonoBehaviour
 
         cpuImageConversionStopwatch.Restart();
 
-        // --- NEW: Explicitly set model input dimensions based on onnxruntime analysis ---
-        int targetWidthForModel = 320;
-        int targetHeightForModel = 320;
-        // int targetWidthForModel = (sentisModelWidth > 0) ? sentisModelWidth : inputResolution.x; // OLD Fallback logic
-        // int targetHeightForModel = (sentisModelHeight > 0) ? sentisModelHeight : inputResolution.y; // OLD Fallback logic
+        int targetWidthForModel;
+        int targetHeightForModel;
+
+        if (sentisModelWidth > 0 && sentisModelHeight > 0)
+        {
+            targetWidthForModel = sentisModelWidth;
+            targetHeightForModel = sentisModelHeight;
+        }
+        else
+        {
+            LogWarning($"[ProcessCameraFrameCoroutine] Invalid model dimensions (W:{sentisModelWidth}, H:{sentisModelHeight}). Falling back to configured inputResolution ({inputResolution.x}x{inputResolution.y}).", DebugFlags.CameraTexture);
+            targetWidthForModel = inputResolution.x;
+            targetHeightForModel = inputResolution.y;
+        }
 
         if ((debugFlags & DebugFlags.CameraTexture) != 0)
             Log($"[ProcessCameraFrameCoroutine] Preparing to convert XRCpuImage ({cpuImage.width}x{cpuImage.height}) to {targetWidthForModel}x{targetHeightForModel} for model input.", DebugFlags.CameraTexture);
@@ -2070,9 +2147,9 @@ public class WallSegmentation : MonoBehaviour
                 LogError("[WallSegmentation] segmentationMaskTexture is null. Cannot perform upscaling.", DebugFlags.TensorProcessing);
                 errorOccurred = true;
                 RenderTexture.ReleaseTemporary(m_LowResMask); // This was an error, m_LowResMask is not temporary
-                // Should be: if (m_LowResMask != null && m_LowResMask.IsCreated()) { texturePool.ReleaseTexture(m_LowResMask); m_LowResMask = null; }
-                // However, the logic above should already handle m_LowResMask not being valid.
-                // If segmentationMaskTexture is null, we cannot proceed.
+                                                              // Should be: if (m_LowResMask != null && m_LowResMask.IsCreated()) { texturePool.ReleaseTexture(m_LowResMask); m_LowResMask = null; }
+                                                              // However, the logic above should already handle m_LowResMask not being valid.
+                                                              // If segmentationMaskTexture is null, we cannot proceed.
                 yield break;
             }
 
@@ -2124,6 +2201,12 @@ public class WallSegmentation : MonoBehaviour
                             // thresholdMaskMaterial.SetFloat("_Threshold", 0.5f); // Can be set on material asset or here
                             Graphics.Blit(blurredLowResMask, m_LowResMask, thresholdMaskMaterial); // Apply threshold back to m_LowResMask
                             if ((debugFlags & DebugFlags.TensorProcessing) != 0) Log("[RunInferenceAndPostProcess] Threshold applied to blurred m_LowResMask.", DebugFlags.TensorProcessing);
+
+                            // ADDED DEBUG SAVE: m_LowResMask AFTER threshold material
+                            if (saveDebugMasks && (debugFlags & DebugFlags.TensorProcessing) != 0)
+                            {
+                                SaveTextureForDebug(m_LowResMask, $"DebugMaskOutput_ThresholdedLowRes_F{Time.frameCount}.png");
+                            }
                         }
                         else { LogWarning("[RunInferenceAndPostProcess] ThresholdMask shader not supported on this platform.", DebugFlags.TensorProcessing); }
                     }
@@ -2679,5 +2762,62 @@ public class WallSegmentation : MonoBehaviour
         }
         lowResMask = null;
         return false;
+    }
+
+    /// <summary>
+    /// Убеждается, что m_LowResMask существует и имеет правильные размеры и формат.
+    /// Если нет, (пере)создает ее из пула.
+    /// </summary>
+    private void EnsureLowResMask(int width, int height)
+    {
+        if (texturePool == null)
+        {
+            LogError("[EnsureLowResMask] TexturePool is null. Cannot create m_LowResMask.", DebugFlags.Initialization);
+            return;
+        }
+
+        if (width <= 0 || height <= 0)
+        {
+            LogError($"[EnsureLowResMask] Invalid dimensions for m_LowResMask: {width}x{height}. Cannot create.", DebugFlags.Initialization);
+            return;
+        }
+
+        bool needsRecreation = false;
+        if (m_LowResMask == null || !m_LowResMask.IsCreated())
+        {
+            needsRecreation = true;
+        }
+        else if (m_LowResMask.width != width || m_LowResMask.height != height || m_LowResMask.format != RenderTextureFormat.R8)
+        {
+            LogWarning($"[EnsureLowResMask] m_LowResMask ({m_LowResMask.width}x{m_LowResMask.height}, {m_LowResMask.format}) needs recreation for new size {width}x{height} or format R8.", DebugFlags.Initialization);
+            texturePool.ReleaseTexture(m_LowResMask);
+            TrackResourceRelease("m_LowResMask_PreRecreate_Ensure");
+            m_LowResMask = null; // Ensure it's null so it gets re-fetched
+            needsRecreation = true;
+        }
+
+        if (needsRecreation)
+        {
+            m_LowResMask = texturePool.GetTexture(width, height, RenderTextureFormat.R8);
+            m_LowResMask.name = "WallSegmentation_LowResMask_Field_Dynamic";
+            m_LowResMask.enableRandomWrite = false;
+            m_LowResMask.filterMode = FilterMode.Point;
+            if (!m_LowResMask.IsCreated())
+            {
+                m_LowResMask.Create();
+            }
+            ClearRenderTexture(m_LowResMask, Color.clear);
+            TrackResourceCreation("m_LowResMask_Field_Dynamic");
+            Log($"[EnsureLowResMask] Создана/получена m_LowResMask ({width}x{height}, R8, Point).", DebugFlags.Initialization);
+        }
+        else
+        {
+            // Texture existed and is correct, ensure properties are still as expected
+            m_LowResMask.enableRandomWrite = false;
+            m_LowResMask.filterMode = FilterMode.Point;
+            // Optionally clear if it might be dirty from previous use, though pool should return clean textures
+            ClearRenderTexture(m_LowResMask, Color.clear);
+            Log($"[EnsureLowResMask] m_LowResMask ({width}x{height}, R8, Point) already exists and is correct.", DebugFlags.Initialization);
+        }
     }
 }

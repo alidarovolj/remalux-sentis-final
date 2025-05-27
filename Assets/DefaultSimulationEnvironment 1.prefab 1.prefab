@@ -11,7 +11,7 @@ GameObject:
   - component: {fileID: 6577610204321410567}
   - component: {fileID: 8188554076726190991}
   - component: {fileID: 6803702709992597901}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: LogoQuad
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -94,7 +94,7 @@ GameObject:
   - component: {fileID: 2102184750908522590}
   - component: {fileID: 9031120477342387924}
   - component: {fileID: 6431717040417767508}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: BlackQuad
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -179,7 +179,7 @@ GameObject:
   - component: {fileID: 1594118810536075580}
   - component: {fileID: 1353384515693615784}
   - component: {fileID: 5664617325222014234}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: Floor
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -295,7 +295,7 @@ GameObject:
   m_Component:
   - component: {fileID: 8687952604547441517}
   - component: {fileID: 7027700216025616306}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: Simulated Tracked Image
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -345,7 +345,7 @@ GameObject:
   - component: {fileID: 4847515664673073425}
   - component: {fileID: 5154547298734084881}
   - component: {fileID: 2555832695880872788}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: Cube
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -451,7 +451,7 @@ GameObject:
   - component: {fileID: 6530858046662263605}
   - component: {fileID: 3215108384216239577}
   - component: {fileID: 3067344686904770414}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: Wall
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -567,7 +567,7 @@ GameObject:
   m_Component:
   - component: {fileID: 2770449827095792652}
   - component: {fileID: 7604074379993464214}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: GeneratedSimulatedPlane(Clone)
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -617,7 +617,7 @@ GameObject:
   m_Component:
   - component: {fileID: 4270802234803236213}
   - component: {fileID: 7711892851430715690}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: GeneratedSimulatedPlane(Clone)
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -667,7 +667,7 @@ GameObject:
   m_Component:
   - component: {fileID: 5283108358406351049}
   - component: {fileID: 5314822872707058091}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: SimEnvironmentProbe
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -712,7 +712,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 4744334345910528120}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: Generated Planes
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -746,7 +746,7 @@ GameObject:
   m_Component:
   - component: {fileID: 4365528357719543085}
   - component: {fileID: 7618165371811446966}
-  m_Layer: 30
+  m_Layer: 9
   m_Name: DefaultSimulationEnvironment 1.prefab 1
   m_TagString: Untagged
   m_Icon: {fileID: 0}

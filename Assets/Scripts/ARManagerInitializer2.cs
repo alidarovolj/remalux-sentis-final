@@ -59,7 +59,7 @@ public class ARManagerInitializer2 : MonoBehaviour
     [SerializeField] private float minPlaneSizeInMeters = 0.1f;
     [SerializeField] private int minPixelsDimensionForLowResArea = 4;
     [SerializeField] private int minAreaSizeInLowResPixels = 16;
-    [Range(0, 255)] public byte wallAreaRedChannelThreshold = 128; // Changed from 30 to 128
+    [Range(0, 255)] public byte wallAreaRedChannelThreshold = 250; // Changed from 220 to 250
 
     [Header("Настройки Рейкастинга для Плоскостей")]
     public bool enableDetailedRaycastLogging = true; // Default to true for easier debugging
@@ -854,241 +854,259 @@ public class ARManagerInitializer2 : MonoBehaviour
 
     private bool UpdateOrCreatePlaneForWallArea(Rect area, int textureWidth, int textureHeight, Dictionary<GameObject, bool> visitedPlanesInCurrentMask)
     {
-        // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: ENTERED with Area: {areaToString(area)}, texW:{textureWidth}, texH:{textureHeight} (Direct Log)");
-        Log($"UpdateOrCreatePlaneForWallArea: ENTERED with Area: {areaToString(area)}, texW:{textureWidth}, texH:{textureHeight}", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
-        Vector2 centerUV = new Vector2((area.x + area.width / 2f) / textureWidth, (area.y + area.height / 2f) / textureHeight);
-        Log($"UpdateOrCreatePlaneForWallArea: Area: {areaToString(area)}, CenterUV: ({centerUV.x:F2}, {centerUV.y:F2}) for {textureWidth}x{textureHeight} mask", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
+        string logPrefix = $"[UpdateOrCreatePlaneForWallArea] Area {areaToString(area)} (Tex: {textureWidth}x{textureHeight}) - ";
+        Log(logPrefix + "METHOD ENTRY.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
 
-        if (arCameraManager == null)
+        bool planeCreatedOrUpdatedThisCall = false;
+
+        // Объявляем переменные здесь, чтобы они были доступны во всей области видимости метода
+        Vector3 planePosition = Vector3.zero;
+        Vector3 surfaceNormal = Vector3.forward; // Default to forward if no hit
+        float hitDistance = float.MaxValue;
+        bool validHitFound = false;
+        RaycastHit physicsHitInfo = new RaycastHit(); // Initialize with a default value
+        GameObject hitObject = null;
+
+
+        if (arCameraManager == null || arRaycastManager == null || arAnchorManager == null || planeManager == null || xrOrigin == null)
         {
-            // Debug.LogError($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: arCameraManager is NULL. Returning false. (Direct Log)");
-            LogError($"UpdateOrCreatePlaneForWallArea: arCameraManager is NULL. Returning false.", ARManagerDebugFlags.Raycasting);
-            // LogError("ARCameraManager is null in UpdateOrCreatePlaneForWallArea.", ARManagerDebugFlags.Raycasting); // This was a duplicate, already covered by the line above
+            LogError(logPrefix + "One or more required AR components are null. Aborting.", ARManagerDebugFlags.PlaneGeneration);
             return false;
         }
+
         Camera cam = arCameraManager.GetComponent<Camera>();
         if (cam == null)
         {
-            // Debug.LogError($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: arCameraManager.GetComponent<Camera>() is NULL. Returning false. (Direct Log)");
-            LogError($"UpdateOrCreatePlaneForWallArea: arCameraManager.GetComponent<Camera>() is NULL. Returning false.", ARManagerDebugFlags.Raycasting);
-            // LogError("ARCameraManager's Camera component is null in UpdateOrCreatePlaneForWallArea.", ARManagerDebugFlags.Raycasting); // Duplicate
+            LogError(logPrefix + "ARCameraManager does not have a Camera component. Aborting.", ARManagerDebugFlags.PlaneGeneration);
             return false;
         }
 
-        // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: All required components (arCameraManager, Camera) are present. Proceeding with Physics.Raycast. (Direct Log)");
-        Log($"UpdateOrCreatePlaneForWallArea: All required components (arCameraManager, Camera) are present. Proceeding with Physics.Raycast.", ARManagerDebugFlags.Raycasting);
+        Transform cameraTransform = cam.transform;
+        Vector2 screenCenterOfArea = area.center; // Используем центр области из маски
+        // Важно: ScreenPointToRay ожидает пиксельные координаты экрана, а не UV.
+        // screenCenterOfArea (area.center) уже в пикселях low-res маски.
+        // Нужно преобразовать их в координаты полного экрана, если arCameraManager.ScreenPointToRay этого ожидает.
+        // Однако, если cam это камера AR, ScreenPointToRay(pixelCoords) обычно работает с экранными пикселями.
+        // area.center относится к текстуре lowResSegmentationMask.
+        // Для преобразования в экранные координаты: (area.center.x / textureWidth) * Screen.width
+        // Но рейкаст должен исходить из центра ОБНАРУЖЕННОЙ области на экране.
+        // Проверим, как screenCenterOfArea соотносится с cam.ScreenPointToRay.
+        // Пока предполагаем, что ray из центра области на экране.
+        // Если рейкаст делается по low-res маске, то и координаты должны быть для нее.
+        // Но сам рейкаст идет в 3D мир из основной камеры.
+        // Для корректного преобразования UV-координат (0-1) в экранные: Vector2 screenPoint = new Vector2(uv.x * cam.pixelWidth, uv.y * cam.pixelHeight);
+        Vector2 uvCenter = new Vector2(area.center.x / textureWidth, area.center.y / textureHeight);
+        Vector2 screenPointForRay = new Vector2(uvCenter.x * cam.pixelWidth, uvCenter.y * cam.pixelHeight);
 
-        Camera currentARCamera = cam;
-        Ray ray = currentARCamera.ScreenPointToRay(new Vector2(centerUV.x * Screen.width, centerUV.y * Screen.height));
+        Ray ray = cam.ScreenPointToRay(screenPointForRay);
+        Log(logPrefix + $"Ray created from UV {uvCenter.ToString("F3")} -> ScreenPt {screenPointForRay.ToString("F0")} : Origin={ray.origin.ToString("F3")}, Direction={ray.direction.ToString("F3")}", ARManagerDebugFlags.Raycasting);
+        if ((debugFlags & ARManagerDebugFlags.Raycasting) != 0) Debug.DrawRay(ray.origin, ray.direction * maxRayDistance, Color.yellow, 2.0f);
 
-        RaycastHit hitInfo;
+        List<ARRaycastHit> arHits = new List<ARRaycastHit>();
+        bool arHitDetected = false;
+        Pose arHitPose = Pose.identity;
+        float closestARHitDistance = float.MaxValue;
+        ARRaycastHit bestARHit = new ARRaycastHit(); // Store the best AR hit
 
-        // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: About to call Physics.Raycast. Ray: O={ray.origin}, D={ray.direction}, MaxDist: {maxRayDistance}, LayerMask: {LayerMaskToString(hitLayerMask)} (Value: {hitLayerMask.value}) (Direct Log)");
-        Log($"UpdateOrCreatePlaneForWallArea: About to call Physics.Raycast. Ray: O={ray.origin}, D={ray.direction}, MaxDist: {maxRayDistance}, LayerMask: {LayerMaskToString(hitLayerMask)} (Value: {hitLayerMask.value})", ARManagerDebugFlags.Raycasting);
-        bool didHit = Physics.Raycast(ray, out hitInfo, maxRayDistance, hitLayerMask);
-        // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: Physics.Raycast returned {didHit}. {(didHit ? $"Hit: {hitInfo.collider.name}, Point: {hitInfo.point}, Normal: {hitInfo.normal}, Dist: {hitInfo.distance}" : "No hit.")} (Direct Log)");
-        Log($"UpdateOrCreatePlaneForWallArea: Physics.Raycast returned {didHit}. {(didHit ? $"Hit: {hitInfo.collider.name}, Point: {hitInfo.point}, Normal: {hitInfo.normal}, Dist: {hitInfo.distance}" : "No hit.")}", ARManagerDebugFlags.Raycasting);
-
-        if (enableDetailedRaycastLogging)
+        //string trackableTypesToLog = TrackableType.PlaneWithinPolygon.ToString();
+        //Log(logPrefix + $"Attempting ARRaycast against TrackableType: {trackableTypesToLog}...", ARManagerDebugFlags.Raycasting);
+        //if (arRaycastManager.Raycast(ray, arHits, TrackableType.PlaneWithinPolygon))
+        string trackableTypesToLog = TrackableType.All.ToString(); // MODIFIED: Broaden to All
+        Log(logPrefix + $"Attempting ARRaycast against TrackableType: {trackableTypesToLog}...", ARManagerDebugFlags.Raycasting);
+        if (arRaycastManager.Raycast(ray, arHits, TrackableType.All)) // MODIFIED: Use TrackableType.All
         {
-            GameObject debugLine = new GameObject("DebugRayLine_WallArea_Physics_" + Time.frameCount + "_" + centerUV.x.ToString("F2"));
-            LineRenderer lr = debugLine.AddComponent<LineRenderer>();
-
-            if (debugRayMaterial != null)
+            Log(logPrefix + $"ARRaycastManager.Raycast returned {arHits.Count} hit(s). Processing...", ARManagerDebugFlags.Raycasting);
+            foreach (var hit in arHits)
             {
-                lr.material = debugRayMaterial;
-                debugRayMaterialPropertyBlock.SetColor("_Color", didHit ? Color.green : Color.red);
-                lr.SetPropertyBlock(debugRayMaterialPropertyBlock);
-                // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: Using assigned/created debugRayMaterial: {debugRayMaterial.name}, Shader: {debugRayMaterial.shader.name} (Direct Log)");
-                Log($"UpdateOrCreatePlaneForWallArea: Using assigned/created debugRayMaterial: {debugRayMaterial.name}, Shader: {debugRayMaterial.shader.name}", ARManagerDebugFlags.Raycasting);
+                float distanceToHit = Vector3.Distance(cameraTransform.position, hit.pose.position);
+                Log(logPrefix + $"  Checking AR hit: Type={hit.hitType}, TrackableId={hit.trackableId}, PosePos={hit.pose.position.ToString("F3")}, ARDist={hit.distance:F2}, CalcDist={distanceToHit:F2}", ARManagerDebugFlags.Raycasting);
+
+                if (Vector3.Dot(cameraTransform.forward, (hit.pose.position - cameraTransform.position).normalized) > 0.1f) // Хит должен быть достаточно впереди
+                {
+                    if (distanceToHit < closestARHitDistance && distanceToHit < maxRayDistance)
+                    {
+                        closestARHitDistance = distanceToHit;
+                        bestARHit = hit;
+                        arHitDetected = true;
+                        Log(logPrefix + $"    Found new BEST AR candidate. Dist: {closestARHitDistance:F2}", ARManagerDebugFlags.Raycasting);
+                    }
+                    else
+                    {
+                        Log(logPrefix + $"    AR Hit not closer or too far. HitDist: {distanceToHit:F2}, ClosestKnown: {closestARHitDistance:F2}, MaxDist: {maxRayDistance:F2}", ARManagerDebugFlags.Raycasting);
+                    }
+                }
+                else
+                {
+                    Log(logPrefix + "    AR Hit is behind or too close to camera forward plane.", ARManagerDebugFlags.Raycasting);
+                }
+            }
+
+            if (arHitDetected)
+            {
+                arHitPose = bestARHit.pose;
+                if (bestARHit.trackable is ARPlane planeTrackable) { surfaceNormal = planeTrackable.normal; }
+                // Для FeaturePoint или других типов, нормаль может быть менее надежной.
+                // Использование -cameraTransform.forward хорошее предположение, если нет других данных.
+                // Однако, если позже Physics.Raycast даст более точную нормаль, она будет использована.
+                else
+                {
+                    surfaceNormal = -cameraTransform.forward;
+                    Log(logPrefix + "  AR Hit was not an ARPlane, using -camera.forward as initial normal.", ARManagerDebugFlags.Raycasting);
+                }
+                planePosition = arHitPose.position;
+                hitDistance = closestARHitDistance; // Обновляем общую hitDistance
+                validHitFound = true;
+                Log(logPrefix + $"ARRaycast FINAL SUCCESS. Best Hit TrackableId: {bestARHit.trackableId}, Type: {bestARHit.hitType}, FinalDist: {hitDistance:F2}, Pos: {planePosition.ToString("F2")}, Normal: {surfaceNormal.ToString("F2")}", ARManagerDebugFlags.Raycasting);
             }
             else
             {
-                Material tempMat = new Material(Shader.Find("Legacy Shaders/Particles/Alpha Blended Premultiply"));
-                tempMat.SetColor("_TintColor", didHit ? Color.green : Color.red);
-                lr.material = tempMat;
-                // Debug.LogWarning($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: debugRayMaterial was NULL, using fallback Legacy Particle material. Shader: {tempMat.shader.name} (Direct Log)");
-                LogWarning($"UpdateOrCreatePlaneForWallArea: debugRayMaterial was NULL, using fallback Legacy Particle material. Shader: {tempMat.shader.name}", ARManagerDebugFlags.Raycasting);
+                Log(logPrefix + "ARRaycast hits were present but none were deemed valid (too far, behind camera, etc.).", ARManagerDebugFlags.Raycasting);
             }
-
-            lr.startWidth = 0.015f;
-            lr.endWidth = 0.015f;
-            lr.SetPosition(0, ray.origin);
-            lr.SetPosition(1, ray.origin + ray.direction * (didHit ? hitInfo.distance : maxRayDistance));
-            Destroy(debugLine, 2.5f);
-        }
-
-        if (!didHit)
-        {
-            Log($"Physics.Raycast from UpdateOrCreatePlaneForWallArea: No surface hit for area {areaToString(area)}. Ray: O={ray.origin}, D={ray.direction}, LayerMask: {LayerMaskToString(hitLayerMask)}", ARManagerDebugFlags.Raycasting);
-            // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: No surface hit (Physics.Raycast). Attempting to create plane at default distance. (Direct Log)");
-            Log($"UpdateOrCreatePlaneForWallArea: No surface hit (Physics.Raycast). Attempting to create plane at default distance.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
-
-            if (defaultPlaneDistance <= 0)
-            {
-                // Debug.LogWarning($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: defaultPlaneDistance ({defaultPlaneDistance}m) is not positive. Cannot create plane at default distance. Returning false. (Direct Log)");
-                LogWarning($"UpdateOrCreatePlaneForWallArea: defaultPlaneDistance ({defaultPlaneDistance}m) is not positive. Cannot create plane at default distance. Returning false.", ARManagerDebugFlags.PlaneGeneration);
-                return false;
-            }
-
-            Vector3 defaultHitPosition = ray.origin + ray.direction * defaultPlaneDistance;
-            Vector3 defaultHitNormal = currentARCamera.transform.forward; // Corrected: Was -currentARCamera.transform.forward
-            float defaultPlaneWorldWidth, defaultPlaneWorldHeight;
-
-            Log($"Physics.Raycast failed. Creating plane at default distance: {defaultPlaneDistance}m. Position: {defaultHitPosition}, Normal: {defaultHitNormal}", ARManagerDebugFlags.PlaneGeneration);
-
-            Vector3 defaultWorldP00 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMin / textureWidth, area.yMin / textureHeight, defaultPlaneDistance));
-            Vector3 defaultWorldP10 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMax / textureWidth, area.yMin / textureHeight, defaultPlaneDistance));
-            Vector3 defaultWorldP01 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMin / textureWidth, area.yMax / textureHeight, defaultPlaneDistance));
-            defaultPlaneWorldWidth = Vector3.Distance(defaultWorldP00, defaultWorldP10);
-            defaultPlaneWorldHeight = Vector3.Distance(defaultWorldP00, defaultWorldP01);
-
-            if (defaultPlaneWorldWidth < minPlaneSizeInMeters || defaultPlaneWorldHeight < minPlaneSizeInMeters)
-            {
-                Log($"Estimated plane size ({defaultPlaneWorldWidth:F2}x{defaultPlaneWorldHeight:F2}m) at default distance too small for area {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
-                return false;
-            }
-
-            planeInstanceCounter++;
-            string defaultPlaneName = "WallSegmentGen_DefaultDist_" + planeInstanceCounter;
-            GameObject defaultPlaneObject = new GameObject(defaultPlaneName);
-            defaultPlaneObject.transform.position = defaultHitPosition;
-            defaultPlaneObject.transform.rotation = Quaternion.LookRotation(defaultHitNormal, currentARCamera.transform.up); // Corrected: Was using hitNormal which is wrong here
-
-            Mesh defaultPlaneMesh = CreatePlaneMesh(defaultPlaneWorldWidth, defaultPlaneWorldHeight);
-            MeshFilter defaultMf = defaultPlaneObject.AddComponent<MeshFilter>();
-            defaultMf.sharedMesh = defaultPlaneMesh;
-            MeshRenderer defaultMr = defaultPlaneObject.AddComponent<MeshRenderer>();
-
-            Material defaultMaterialToApply = GetMaterialForPlane(defaultHitNormal);
-            if (defaultMaterialToApply == null)
-            {
-                LogError($"No suitable material found for default plane {defaultPlaneName} with normal {defaultHitNormal}.", ARManagerDebugFlags.PlaneGeneration);
-                Destroy(defaultPlaneObject);
-                return false;
-            }
-            defaultMr.material = Instantiate(defaultMaterialToApply);
-
-            if (defaultMr.material.HasProperty("_SegmentationMask") && wallSegmentation != null && wallSegmentation.segmentationMaskTexture != null)
-            {
-                defaultMr.material.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
-                Rect uvRect = new Rect(area.x / textureWidth, area.y / textureHeight, area.width / textureWidth, area.height / textureHeight);
-                defaultMr.material.SetVector("_Mask_UV_Rect", new Vector4(uvRect.xMin, uvRect.yMin, uvRect.width, uvRect.height));
-            }
-
-            defaultMr.shadowCastingMode = ShadowCastingMode.Off;
-            defaultMr.receiveShadows = false;
-            defaultPlaneObject.isStatic = false;
-
-            int defaultLayerId = LayerMask.NameToLayer(planeLayerName);
-            if (defaultLayerId != -1) defaultPlaneObject.layer = defaultLayerId;
-            else LogError($"Layer '{planeLayerName}' for generated planes not found.", ARManagerDebugFlags.PlaneGeneration);
-
-            generatedPlanes.Add(defaultPlaneObject);
-            planeCreationTimes[defaultPlaneObject] = Time.time;
-            planeLastVisitedTime[defaultPlaneObject] = Time.time;
-
-            Transform defaultParentTransform = xrOrigin?.TrackablesParent;
-            if (defaultParentTransform != null) defaultPlaneObject.transform.SetParent(defaultParentTransform, true);
-            else LogWarning($"TrackablesParent not found on XROrigin. Generated default plane {defaultPlaneName} will be at root.", ARManagerDebugFlags.Initialization);
-
-            Log($"Created new DEFAULT DISTANCE plane {defaultPlaneName} for area {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
-            if (visitedPlanesInCurrentMask != null) visitedPlanesInCurrentMask[defaultPlaneObject] = true;
-            return true;
         }
         else
         {
-            if (hitInfo.distance > maxRayDistance || hitInfo.distance < minHitDistanceThreshold)
+            Log(logPrefix + "ARRaycastManager found NO hits at all.", ARManagerDebugFlags.Raycasting);
+        }
+
+        Log(logPrefix + $"Attempting Physics.Raycast... Current best hitDistance (from AR): {hitDistance:F2}", ARManagerDebugFlags.Raycasting);
+        if (Physics.Raycast(ray, out physicsHitInfo, maxRayDistance, hitLayerMask))
+        {
+            Log(logPrefix + $"Physics.Raycast hit object '{physicsHitInfo.collider.name}' at distance {physicsHitInfo.distance:F2}m. Normal: {physicsHitInfo.normal.ToString("F2")}", ARManagerDebugFlags.Raycasting);
+            if (IsIgnoredObject(physicsHitInfo.collider.gameObject))
             {
-                Log($"Physics.Raycast from UpdateOrCreatePlaneForWallArea: Hit was outside distance thresholds ({hitInfo.distance:F2}m) for area {areaToString(area)}", ARManagerDebugFlags.Raycasting);
-                // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: EXITED. Hit outside distance thresholds. Returning false. (Direct Log)");
-                Log($"UpdateOrCreatePlaneForWallArea: EXITED. Hit outside distance thresholds. Returning false.", ARManagerDebugFlags.Raycasting);
-                return false;
+                Log(logPrefix + "  Physics hit an IGNORED object. No change to validHitFound.", ARManagerDebugFlags.Raycasting);
             }
-
-            if (IsIgnoredObject(hitInfo.collider.gameObject))
+            // Если Physics.Raycast попал БЛИЖЕ, чем существующий ARRaycast (или если ARRaycast не дал валидного хита, тогда hitDistance все еще float.MaxValue)
+            else if (physicsHitInfo.distance < hitDistance - 0.01f) // Добавляем небольшой порог, чтобы избежать Z-fighting при почти одинаковых расстояниях
             {
-                Log($"Physics.Raycast hit an ignored object: {hitInfo.collider.name} at {hitInfo.point}. Skipping plane creation.", ARManagerDebugFlags.Raycasting);
-                // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: EXITED. Hit ignored object {hitInfo.collider.name}. Returning false. (Direct Log)");
-                Log($"UpdateOrCreatePlaneForWallArea: EXITED. Hit ignored object {hitInfo.collider.name}. Returning false.", ARManagerDebugFlags.Raycasting);
-                return false;
-            }
-
-            Vector3 hitPosition = hitInfo.point;
-            Vector3 hitNormal = hitInfo.normal;
-
-            Log($"Best Physics.Raycast hit for area {areaToString(area)}: Object: {hitInfo.collider.name}, Dist: {hitInfo.distance:F2}, Pos: {hitPosition}, Normal: {hitNormal}", ARManagerDebugFlags.Raycasting);
-
-            Vector3 worldP00 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMin / textureWidth, area.yMin / textureHeight, hitInfo.distance));
-            Vector3 worldP10 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMax / textureWidth, area.yMin / textureHeight, hitInfo.distance));
-            Vector3 worldP01 = currentARCamera.ViewportToWorldPoint(new Vector3(area.xMin / textureWidth, area.yMax / textureHeight, hitInfo.distance));
-            float planeWorldWidth = Vector3.Distance(worldP00, worldP10);
-            float planeWorldHeight = Vector3.Distance(worldP00, worldP01);
-
-            if (planeWorldWidth < minPlaneSizeInMeters || planeWorldHeight < minPlaneSizeInMeters)
-            {
-                Log($"Estimated plane size ({planeWorldWidth:F2}x{planeWorldHeight:F2}m) too small for area {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
-                // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: EXITED. Estimated plane size too small. Returning false. (Direct Log)");
-                Log($"UpdateOrCreatePlaneForWallArea: EXITED. Estimated plane size too small. Returning false.", ARManagerDebugFlags.PlaneGeneration);
-                return false;
-            }
-
-            planeInstanceCounter++;
-            string planeName = "WallSegmentGen_" + planeInstanceCounter;
-            GameObject planeObject = new GameObject(planeName);
-            planeObject.transform.position = hitPosition;
-            planeObject.transform.rotation = Quaternion.LookRotation(hitNormal, currentARCamera.transform.up);
-
-            Mesh planeMesh = CreatePlaneMesh(planeWorldWidth, planeWorldHeight);
-            MeshFilter mf = planeObject.AddComponent<MeshFilter>();
-            mf.sharedMesh = planeMesh;
-            MeshRenderer mr = planeObject.AddComponent<MeshRenderer>();
-
-            Material materialToApply = GetMaterialForPlane(hitNormal);
-            if (materialToApply == null)
-            {
-                LogError($"No suitable material (Vertical or Horizontal) found for plane {planeName} with normal {hitNormal}. Assign materials in ARManagerInitializer2.", ARManagerDebugFlags.PlaneGeneration);
-                Destroy(planeObject);
-                // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: EXITED. No suitable material. Returning false. (Direct Log)");
-                Log($"UpdateOrCreatePlaneForWallArea: EXITED. No suitable material. Returning false.", ARManagerDebugFlags.PlaneGeneration);
-                return false;
-            }
-            mr.material = Instantiate(materialToApply);
-
-            if (mr.material.HasProperty("_SegmentationMask") && wallSegmentation != null && wallSegmentation.segmentationMaskTexture != null)
-            {
-                mr.material.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
-                Rect uvRect = new Rect(area.x / textureWidth, area.y / textureHeight, area.width / textureWidth, area.height / textureHeight);
-                mr.material.SetVector("_Mask_UV_Rect", new Vector4(uvRect.xMin, uvRect.yMin, uvRect.width, uvRect.height));
-                Log($"Applied segmentation mask and UV rect {uvRect} to plane {planeName}", ARManagerDebugFlags.PlaneGeneration);
+                Log(logPrefix + $"Physics.Raycast OVERRODE ARRaycast or was the ONLY valid hit. Old AR dist: {hitDistance:F2}, New Phys dist: {physicsHitInfo.distance:F2}. Updating plane info.", ARManagerDebugFlags.Raycasting);
+                planePosition = physicsHitInfo.point;
+                surfaceNormal = physicsHitInfo.normal;
+                hitDistance = physicsHitInfo.distance;
+                validHitFound = true; // Этот хит теперь валидный
+                hitObject = physicsHitInfo.collider.gameObject; // Запоминаем объект, если понадобится
+                arHitPose = Pose.identity; // Сбрасываем AR хит, так как физический хит имеет приоритет для позиции/нормали
             }
             else
             {
-                LogWarning($"Could not apply segmentation mask to {planeName}. Material lacks prop, wallSegmentation is null, or its texture is null.", ARManagerDebugFlags.PlaneGeneration);
+                Log(logPrefix + $"Physics.Raycast hit was NOT closer (PhysD: {physicsHitInfo.distance:F2} vs ARD: {hitDistance:F2}). Current valid hit (if any) from ARRaycast remains preferred.", ARManagerDebugFlags.Raycasting);
             }
-
-            mr.shadowCastingMode = ShadowCastingMode.Off;
-            mr.receiveShadows = false;
-            planeObject.isStatic = false;
-
-            int layerId = LayerMask.NameToLayer(planeLayerName);
-            if (layerId != -1) planeObject.layer = layerId;
-            else LogError($"Layer '{planeLayerName}' for generated planes not found. Define it in Tags and Layers.", ARManagerDebugFlags.PlaneGeneration);
-
-            generatedPlanes.Add(planeObject);
-            planeCreationTimes[planeObject] = Time.time;
-            planeLastVisitedTime[planeObject] = Time.time;
-
-            Transform parentTransform = xrOrigin?.TrackablesParent;
-            if (parentTransform != null) planeObject.transform.SetParent(parentTransform, true);
-            else LogWarning($"TrackablesParent not found on XROrigin. Generated plane {planeName} will be at root.", ARManagerDebugFlags.Initialization);
-
-            Log($"Created new plane {planeName} for area {areaToString(area)} at pos {hitPosition}, normal {hitNormal}. Size: {planeWorldWidth:F2}x{planeWorldHeight:F2}m", ARManagerDebugFlags.PlaneGeneration);
-            if (visitedPlanesInCurrentMask != null) visitedPlanesInCurrentMask[planeObject] = true;
-            // Debug.Log($"[{this.GetType().Name}] UpdateOrCreatePlaneForWallArea: EXITED. Plane created successfully. Returning true. (Direct Log)");
-            Log($"UpdateOrCreatePlaneForWallArea: EXITED. Plane created successfully. Returning true.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
-            return true;
         }
+        else
+        {
+            Log(logPrefix + "Physics.Raycast found NO hits within range or layer.", ARManagerDebugFlags.Raycasting);
+        }
+
+        if (!validHitFound)
+        {
+            Log(logPrefix + "No valid AR or Physics hit found after all checks. Plane will NOT be created. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
+            if ((debugFlags & ARManagerDebugFlags.Raycasting) != 0) Debug.DrawRay(ray.origin, ray.direction * maxRayDistance, Color.magenta, 2.0f);
+            return false;
+        }
+        Log(logPrefix + $"FINAL VALID HIT CHOSEN. Position: {planePosition.ToString("F2")}, Normal: {surfaceNormal.ToString("F2")}, Distance: {hitDistance:F2}. Was AR Hit anchored: {arHitPose != Pose.identity}", ARManagerDebugFlags.PlaneGeneration);
+
+        Log(logPrefix + "Checking if surface is vertical... Normal: " + surfaceNormal.ToString("F3"), ARManagerDebugFlags.PlaneGeneration);
+        if (!IsSurfaceVertical(surfaceNormal))
+        {
+            Log(logPrefix + $"Surface normal {surfaceNormal.ToString("F2")} is NOT vertical enough (max angle: {maxWallNormalAngleDeviation}). Plane creation SKIPPED. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration);
+            return false;
+        }
+        Log(logPrefix + "Surface IS vertical. Proceeding to create/update plane.", ARManagerDebugFlags.PlaneGeneration);
+
+        // --- Существующая логика создания новой плоскости (или обновления существующей) должна быть здесь ---
+        // Временно упрощенный код создания новой плоскости для теста:
+        Log(logPrefix + "Proceeding to create a NEW plane (existing plane update logic temporarily bypassed for detailed logging test).", ARManagerDebugFlags.PlaneGeneration);
+
+        GameObject newPlaneGo = new GameObject($"GeneratedWallPlane_{planeInstanceCounter++}");
+        Transform parentToUse = null;
+        if (xrOrigin != null && xrOrigin.TrackablesParent != null)
+        {
+            parentToUse = xrOrigin.TrackablesParent;
+        }
+        else
+        {
+            LogWarning(logPrefix + "xrOrigin.TrackablesParent is null. Plane will be at root.", ARManagerDebugFlags.PlaneGeneration);
+            // parentToUse remains null, plane will be at root
+        }
+
+        if (parentToUse != null)
+        {
+            newPlaneGo.transform.SetParent(parentToUse, false);
+        }
+
+        newPlaneGo.layer = LayerMask.NameToLayer(planeLayerName);
+        newPlaneGo.transform.position = planePosition;
+        newPlaneGo.transform.rotation = Quaternion.LookRotation(-surfaceNormal, Vector3.up);
+
+        Log(logPrefix + $"Set new plane '{newPlaneGo.name}' Transform: Pos={planePosition.ToString("F2")}, RotQ={newPlaneGo.transform.rotation.ToString("F3")}, Parent={(parentToUse != null ? parentToUse.name : "Root")}", ARManagerDebugFlags.PlaneGeneration);
+
+        // TODO: Рассчитать реальные мировые размеры плоскости на основе hitDistance, FOV камеры и UV-размеров области `area`.
+        // Vector2 planeSizeInWorld = CalculateWorldSizeOfArea(area, textureWidth, textureHeight, hitDistance, cam);
+        // Mesh planeMesh = CreatePlaneMesh(planeSizeInWorld.x, planeSizeInWorld.y);
+        // Используем временные размеры для меша, пока не будет точного расчета мировых размеров
+        Mesh planeMesh = CreatePlaneMesh(0.5f, 0.5f); // Временный размер 0.5x0.5 метра для заметности
+        LogWarning(logPrefix + $"Created plane with TEMPORARY {planeMesh.bounds.size.x}x{planeMesh.bounds.size.y} meter size. Implement actual world size calculation.", ARManagerDebugFlags.PlaneGeneration);
+
+        MeshFilter meshFilter = newPlaneGo.AddComponent<MeshFilter>();
+        meshFilter.mesh = planeMesh;
+
+        MeshRenderer meshRenderer = newPlaneGo.AddComponent<MeshRenderer>();
+        Material matToAssign = GetMaterialForPlane(surfaceNormal, PlaneAlignment.Vertical); // Принудительно вертикальный, т.к. IsSurfaceVertical пройдена
+        if (matToAssign == null)
+        {
+            LogError(logPrefix + $"GetMaterialForPlane returned null for normal {surfaceNormal} (expected vertical). Cannot assign material. Aborting plane creation.", ARManagerDebugFlags.PlaneGeneration);
+            Destroy(newPlaneGo);
+            return false;
+        }
+        meshRenderer.material = matToAssign;
+        Log(logPrefix + $"Assigned material '{matToAssign.name}' to plane '{newPlaneGo.name}'.", ARManagerDebugFlags.PlaneGeneration);
+
+        MeshCollider meshCollider = newPlaneGo.AddComponent<MeshCollider>();
+        meshCollider.sharedMesh = planeMesh;
+        meshCollider.convex = false;
+
+        ARAnchor anchor = null;
+        // Приоритет отдаем созданию якоря на основе ARRaycastHit, если он был источником validHitFound и arHitPose не сброшен
+        if (arHitPose != Pose.identity)
+        {
+            anchor = arAnchorManager.AddAnchor(arHitPose);
+            Log(logPrefix + (anchor ? $"ARAnchor created from ARRaycastHit ({arHitPose.position.ToString("F2")}) for '{newPlaneGo.name}'."
+                                     : $"Failed to create ARAnchor from ARRaycastHit for '{newPlaneGo.name}'."), ARManagerDebugFlags.PlaneGeneration);
+        }
+        // Если arHitPose был сброшен (т.е. Physics hit имел приоритет) или AR хит не дал якоря, пробуем создать якорь по финальной planePosition
+        else if (validHitFound && anchor == null)
+        {
+            Pose physicsBasedPose = new Pose(planePosition, newPlaneGo.transform.rotation);
+            anchor = arAnchorManager.AddAnchor(physicsBasedPose);
+            Log(logPrefix + (anchor ? $"ARAnchor created from final plane pose (likely Physics based: {planePosition.ToString("F2")}) for '{newPlaneGo.name}'."
+                                     : $"Failed to create ARAnchor from final plane pose for '{newPlaneGo.name}'."), ARManagerDebugFlags.PlaneGeneration);
+        }
+
+        if (anchor)
+        {
+            newPlaneGo.transform.SetParent(anchor.transform, true); // World position Stays
+            Log(logPrefix + $"Successfully parented '{newPlaneGo.name}' to ARAnchor '{anchor.name}'.", ARManagerDebugFlags.PlaneGeneration);
+        }
+        else
+        {
+            LogWarning(logPrefix + $"Plane '{newPlaneGo.name}' created WITHOUT an ARAnchor.", ARManagerDebugFlags.PlaneGeneration);
+        }
+
+        generatedPlanes.Add(newPlaneGo);
+        if (persistentGeneratedPlanes.ContainsKey(newPlaneGo)) persistentGeneratedPlanes[newPlaneGo] = false;
+        else persistentGeneratedPlanes.Add(newPlaneGo, false);
+
+        if (planeCreationTimes.ContainsKey(newPlaneGo)) planeCreationTimes[newPlaneGo] = Time.time;
+        else planeCreationTimes.Add(newPlaneGo, Time.time);
+
+        if (planeLastVisitedTime.ContainsKey(newPlaneGo)) planeLastVisitedTime[newPlaneGo] = Time.time;
+        else planeLastVisitedTime.Add(newPlaneGo, Time.time);
+
+        planeCreatedOrUpdatedThisCall = true;
+        visitedPlanesInCurrentMask[newPlaneGo] = true;
+
+        Log(logPrefix + $"New plane '{newPlaneGo.name}' created successfully. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration);
+        return planeCreatedOrUpdatedThisCall;
     }
 
     private bool IsIgnoredObject(GameObject obj)
