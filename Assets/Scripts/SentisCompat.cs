@@ -918,4 +918,47 @@ public static class SentisCompat
                   if (debugLogging && methods.Length > 5) Debug.Log($"SentisCompat:   ... и еще {methods.Length - 5} методов (полный список скрыт для краткости).");
             }
       }
+
+      public static bool RenderTensorToTexture(object tensor, RenderTexture targetTexture, object textureTransform)
+      {
+            if (!isInitialized) Initialize();
+            if (TextureConverterType == null || TensorType == null || TextureTransformType == null || targetTexture == null || tensor == null)
+            {
+                  Debug.LogError("SentisCompat: RenderTensorToTexture(Tensor, RT, TT) - Critical type or argument is null.");
+                  DiagnosticReport();
+                  return false;
+            }
+
+            if (!TensorType.IsInstanceOfType(tensor))
+            {
+                  Debug.LogError($"SentisCompat: Input tensor is of incorrect type {tensor.GetType().FullName}");
+                  return false;
+            }
+
+            if (!TextureTransformType.IsInstanceOfType(textureTransform))
+            {
+                  Debug.LogError($"SentisCompat: Input textureTransform is of incorrect type {textureTransform.GetType().FullName}");
+                  return false;
+            }
+
+            try
+            {
+                  if (renderToTexture3Arg_Cache != null)
+                  {
+                        renderToTexture3Arg_Cache.Invoke(null, new object[] { tensor, targetTexture, textureTransform });
+                        return true;
+                  }
+                  else
+                  {
+                        Debug.LogWarning("SentisCompat: RenderToTexture(Tensor,RT,TT) method not cached. Falling back to 2-arg or manual if available.");
+                        // Попытка вызвать 2-аргументную версию, если 3-аргументная не найдена (хотя это не совсем то, что нужно)
+                        return RenderTensorToTexture(tensor, targetTexture);
+                  }
+            }
+            catch (Exception e)
+            {
+                  Debug.LogError($"SentisCompat: Ошибка при вызове RenderTensorToTexture(Tensor,RT,TT): {e.Message}\n{e.StackTrace}");
+                  return false;
+            }
+      }
 }

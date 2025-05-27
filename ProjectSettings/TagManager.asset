@@ -12,11 +12,11 @@ TagManager:
   - Water
   - UI
   - 
-  - 
+  - Wall
   - ARPlanes
-  - 
-  - 
-  - 
+  - SimulatedEnvironment
+  - Ground
+  - Environment
   - 
   - 
   - 

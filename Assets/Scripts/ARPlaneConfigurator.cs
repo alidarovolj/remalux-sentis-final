@@ -4,6 +4,17 @@ using UnityEngine.XR.ARSubsystems;
 using System.Collections;
 using System.Collections.Generic;
 
+public enum ARPlaneConfiguratorDebugFlags
+{
+    None = 0,
+    Initialization = 1 << 0,
+    PlaneLifecycle = 1 << 1,
+    Stabilization = 1 << 2,
+    Persistence = 1 << 3,
+    MaskApplication = 1 << 4,
+    All = ~0
+}
+
 /// <summary>
 /// Класс, который настраивает ARPlaneManager в рантайме для корректной работы с вертикальными плоскостями.
 /// Решает проблему неверных настроек ARPlaneManager в сцене и привязки плоскостей к мировому пространству.
@@ -30,6 +41,9 @@ public class ARPlaneConfigurator : MonoBehaviour
     [SerializeField] private float minAreaForPersistence = 0.3f; // Минимальная площадь для сохранения плоскости
     [SerializeField] private float mergeOverlapThreshold = 0.5f; // Порог перекрытия для объединения плоскостей (0-1)
     [SerializeField] private bool disablePlaneUpdatesAfterStabilization = true; // Отключить обновление плоскостей после стабилизации
+
+    [Header("Отладка")]
+    [SerializeField] private ARPlaneConfiguratorDebugFlags debugFlags = ARPlaneConfiguratorDebugFlags.None;
 
     // Список отслеживаемых вертикальных плоскостей для стабилизации
     private Dictionary<TrackableId, ARPlane> trackedVerticalPlanes = new Dictionary<TrackableId, ARPlane>();
@@ -556,9 +570,15 @@ public class ARPlaneConfigurator : MonoBehaviour
         // Обработка добавленных плоскостей
         foreach (var plane in args.added)
         {
-            if (plane == null || !plane.gameObject.activeInHierarchy) continue; // Проверка на null и активность
+            if (plane == null || !plane.gameObject.activeInHierarchy) continue;
             planeDetectionTimes[plane.trackableId] = Time.time;
-            arManagerInitializerInstance?.ConfigurePlane(plane); // Вызываем метод из ARManagerInitializer2
+
+            if (arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanes)
+            {
+                ConfigurePlaneInternal(plane);
+            }
+            // else: если useDetectedPlanes = false, то ARManagerInitializer2 обрабатывает плоскости своей кастомной логикой,
+            // и ARPlaneConfigurator не должен вмешиваться в стандартные плоскости.
 
             if (IsVerticalPlane(plane))
             {
@@ -574,7 +594,7 @@ public class ARPlaneConfigurator : MonoBehaviour
         // Обработка обновленных плоскостей
         foreach (var plane in args.updated)
         {
-            if (plane == null || !plane.gameObject.activeInHierarchy) continue; // Проверка на null и активность
+            if (plane == null || !plane.gameObject.activeInHierarchy) continue;
 
             // Если плоскость уже помечена как постоянная и включено отключение обновлений
             if (persistentPlaneIds.Contains(plane.trackableId) && disablePlaneUpdatesAfterStabilization && hasStabilizedPlanes)
@@ -583,10 +603,14 @@ public class ARPlaneConfigurator : MonoBehaviour
                 {
                     Debug.Log($"ARPlaneConfigurator: Игнорируется обновление для постоянной плоскости: {plane.trackableId}");
                 }
-                continue; // Пропускаем обновление
+                continue;
             }
 
-            arManagerInitializerInstance?.UpdatePlane(plane); // Вызываем метод из ARManagerInitializer2
+            if (arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanes)
+            {
+                UpdatePlaneInternal(plane);
+            }
+            // else: см. комментарий выше для ConfigurePlane
 
             if (IsVerticalPlane(plane))
             {
@@ -1157,4 +1181,94 @@ public class ARPlaneConfigurator : MonoBehaviour
             Debug.LogWarning($"[ARPlaneConfigurator] ApplySegmentationMaskToPlane: segmentationMaskTexture from WallSegmentation is null or not created. (IsNull: {wallSegmentation.segmentationMaskTexture == null}, IsCreated: {wallSegmentation.segmentationMaskTexture?.IsCreated()}). Cannot apply to plane {plane.trackableId}.");
         }
     }
+
+    /// <summary>
+    /// Internal configuration logic for ARFoundation planes when useDetectedPlanes is true.
+    /// </summary>
+    private void ConfigurePlaneInternal(ARPlane plane)
+    {
+        if (plane == null) return;
+        // Эта логика очень похожа на то, что раньше было в ARManagerInitializer2.ConfigurePlane
+        // или на то, что вызывал planeConfigurator.ConfigurePlane(plane, wallSegmentationInstance, arManagerInitializerInstance);
+
+        MeshRenderer planeRenderer = plane.GetComponent<MeshRenderer>();
+        if (planeRenderer == null) planeRenderer = plane.gameObject.AddComponent<MeshRenderer>();
+        var visualizer = plane.GetComponent<ARPlaneMeshVisualizer>();
+        if (visualizer != null) visualizer.enabled = true; // Keep visualizer for ARFoundation planes if this path is active
+
+        Material materialToUse = null;
+        if (IsVerticalPlane(plane) && verticalPlaneMaterial != null) materialToUse = verticalPlaneMaterial;
+        else if (!IsVerticalPlane(plane) && arManagerInitializerInstance != null && arManagerInitializerInstance.HorizontalPlaneMaterial != null) materialToUse = arManagerInitializerInstance.HorizontalPlaneMaterial;
+        else if (arManagerInitializerInstance != null && arManagerInitializerInstance.VerticalPlaneMaterial != null) materialToUse = arManagerInitializerInstance.VerticalPlaneMaterial; // Fallback
+        else if (verticalPlaneMaterial != null) materialToUse = verticalPlaneMaterial; // Absolute fallback
+        else materialToUse = new Material(Shader.Find("Standard")); // Last resort fallback
+
+        planeRenderer.material = materialToUse;
+        planeRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        planeRenderer.receiveShadows = false;
+        plane.gameObject.isStatic = false;
+
+        if (arManagerInitializerInstance != null && !string.IsNullOrEmpty(arManagerInitializerInstance.PlaneLayerName))
+        {
+            int layerId = LayerMask.NameToLayer(arManagerInitializerInstance.PlaneLayerName);
+            if (layerId != -1) plane.gameObject.layer = layerId;
+            else LogError($"Layer '{arManagerInitializerInstance.PlaneLayerName}' not found.", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
+        }
+        else
+        {
+            LogWarning("ARManagerInitializerInstance or its PlaneLayerName is not set. Cannot assign layer to plane.", ARPlaneConfiguratorDebugFlags.Initialization);
+        }
+
+        try
+        {
+            ApplySegmentationMaskToPlane(plane, wallSegmentationInstance);
+        }
+        catch (System.Exception ex)
+        {
+            LogError($"Exception during internal plane configuration for {plane.trackableId}: {ex.Message}", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
+        }
+        Log($"ConfigurePlaneInternal executed for plane {plane.trackableId}", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
+    }
+
+    /// <summary>
+    /// Internal update logic for ARFoundation planes when useDetectedPlanes is true.
+    /// </summary>
+    private void UpdatePlaneInternal(ARPlane plane)
+    {
+        if (plane == null) return;
+        // Аналогично ConfigurePlaneInternal, эта логика должна обновлять существующую ARFoundation плоскость
+        MeshRenderer planeRenderer = plane.GetComponent<MeshRenderer>();
+        if (planeRenderer != null)
+        {
+            Material materialToUse = null;
+            if (IsVerticalPlane(plane) && verticalPlaneMaterial != null) materialToUse = verticalPlaneMaterial;
+            else if (!IsVerticalPlane(plane) && arManagerInitializerInstance != null && arManagerInitializerInstance.HorizontalPlaneMaterial != null) materialToUse = arManagerInitializerInstance.HorizontalPlaneMaterial;
+            else if (arManagerInitializerInstance != null && arManagerInitializerInstance.VerticalPlaneMaterial != null) materialToUse = arManagerInitializerInstance.VerticalPlaneMaterial;
+            else if (verticalPlaneMaterial != null) materialToUse = verticalPlaneMaterial;
+            else materialToUse = planeRenderer.material; // Keep existing if no other found
+
+            if (planeRenderer.sharedMaterial != materialToUse) planeRenderer.material = materialToUse; // Avoid re-assigning same material
+        }
+
+        if (wallSegmentationInstance != null && IsVerticalPlane(plane))
+        {
+            ApplySegmentationMaskToPlane(plane, wallSegmentationInstance);
+        }
+        Log($"UpdatePlaneInternal executed for plane {plane.trackableId}", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
+    }
+
+    private void Log(string message, ARPlaneConfiguratorDebugFlags flag = ARPlaneConfiguratorDebugFlags.None, ARManagerLogLevel level = ARManagerLogLevel.Info)
+    {
+        if ((debugFlags & flag) == flag || flag == ARPlaneConfiguratorDebugFlags.All || flag == ARPlaneConfiguratorDebugFlags.None)
+        {
+            string prefix = "[ARPlaneConfigurator] ";
+            if (level == ARManagerLogLevel.Error) Debug.LogError(prefix + message);
+            else if (level == ARManagerLogLevel.Warning) Debug.LogWarning(prefix + message);
+            else Debug.Log(prefix + message);
+        }
+    }
+
+    private void LogError(string message, ARPlaneConfiguratorDebugFlags flag = ARPlaneConfiguratorDebugFlags.None) => Log(message, flag, ARManagerLogLevel.Error);
+
+    private void LogWarning(string message, ARPlaneConfiguratorDebugFlags flag = ARPlaneConfiguratorDebugFlags.None) => Log(message, flag, ARManagerLogLevel.Warning);
 }

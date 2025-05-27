@@ -12,6 +12,8 @@ public class DebugMaskLinker : MonoBehaviour
     private const int SAVE_AFTER_N_UPDATES = 5; // Уменьшено для быстрой проверки
 
     [SerializeField] private Material unlitDisplayMaterial; // Поле для назначения материала в инспекторе
+    [Tooltip("Assign the SegMaskDisplayMaterial here.")]
+    public Material customMaskDisplayMaterial;
 
     void Start()
     {
@@ -23,16 +25,29 @@ public class DebugMaskLinker : MonoBehaviour
             return;
         }
 
+        // --- NEW: Apply customMaskDisplayMaterial ---
+        if (customMaskDisplayMaterial != null)
+        {
+            rawImage.material = Instantiate(customMaskDisplayMaterial); // Use Instantiate to avoid shared material issues if multiple RawImages use this
+            Debug.Log($"[DebugMaskLinker] Назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", gameObject);
+        }
+        else
+        {
+            Debug.LogWarning("[DebugMaskLinker] customMaskDisplayMaterial не назначен. RawImage будет использовать свой текущий или стандартный материал.", gameObject);
+            // Fallback to old logic if custom material is not set, or simply do nothing and let it use its default.
+            // For simplicity, we'll let it use its default or whatever was set before if customMaskDisplayMaterial is null.
+            // The old logic for unlitDisplayMaterial can be removed or kept as a secondary fallback.
+        }
+        // --- END NEW ---
+
+        /* // --- OLD MATERIAL LOGIC - Can be removed or kept as a fallback if customMaskDisplayMaterial is null ---
         // Проверяем, назначен ли материал через инспектор
         if (unlitDisplayMaterial == null)
         {
             Debug.LogError("[DebugMaskLinker] Материал 'Unlit Display Material' не назначен в инспекторе!", gameObject);
-            // Можно попытаться загрузить стандартный, если основной не назначен, или оставить как есть
-            // Например, можно попробовать найти стандартный UI шейдер или просто использовать то, что есть по умолчанию
         }
         else
         {
-            // Применяем назначенный материал, если он отличается от текущего или если текущий - стандартный
             if (rawImage.material == null || rawImage.material.name.Contains("Default") || rawImage.material == GetDefaultUIMaterial())
             {
                 rawImage.material = unlitDisplayMaterial;
@@ -40,17 +55,16 @@ public class DebugMaskLinker : MonoBehaviour
             }
         }
 
-        // Загружаем наш специальный материал, если текущий - стандартный UI материал
-        // Это условие должно быть более точным, чтобы не перезаписывать уже кастомно назначенный материал
         if (unlitDisplayMaterial != null && (rawImage.material == null || rawImage.material.name.Contains("Default") || rawImage.material == GetDefaultUIMaterial()))
         {
             rawImage.material = unlitDisplayMaterial;
             Debug.Log($"[DebugMaskLinker] Назначен кастомный материал '{unlitDisplayMaterial.name}' для RawImage в Start().", gameObject);
         }
-        else if (unlitDisplayMaterial == null)
+        else if (unlitDisplayMaterial == null && customMaskDisplayMaterial == null) // Only warn if no material is set up
         {
-            Debug.LogWarning("[DebugMaskLinker] 'Unlit Display Material' не назначен в инспекторе. RawImage будет использовать свой текущий или стандартный материал.", gameObject);
+            Debug.LogWarning("[DebugMaskLinker] Ни один из материалов (customMaskDisplayMaterial или unlitDisplayMaterial) не назначен. RawImage будет использовать свой текущий или стандартный материал.", gameObject);
         }
+        */ // --- END OLD MATERIAL LOGIC ---
 
         // Отключаем Raycast Target, чтобы UI элемент не блокировал взаимодействие с AR объектами
         if (rawImage.raycastTarget)
@@ -91,11 +105,21 @@ public class DebugMaskLinker : MonoBehaviour
         }
 
         // Проверяем и при необходимости назначаем кастомный материал еще раз здесь, если он слетел
-        if (unlitDisplayMaterial != null && (rawImage.material == null || rawImage.material.name.Contains("Default") || rawImage.material == GetDefaultUIMaterial()))
+        // This check might be redundant if customMaskDisplayMaterial is robustly set in Start and not changed elsewhere.
+        // However, if there's a possibility it could be reset, this ensures it.
+        if (customMaskDisplayMaterial != null && (rawImage.material == null || rawImage.material.shader != customMaskDisplayMaterial.shader))
+        {
+            // If current material is not an instance of our custom shader, re-apply (or apply for the first time if Start failed silently for some reason)
+            rawImage.material = Instantiate(customMaskDisplayMaterial);
+            Debug.Log($"[DebugMaskLinker] (UpdateMaskTexture) ПЕРЕ-назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", gameObject);
+        }
+        /* // --- OLD MATERIAL LOGIC IN UPDATE - Can be removed ---
+        else if (unlitDisplayMaterial != null && (rawImage.material == null || rawImage.material.name.Contains("Default") || rawImage.material == GetDefaultUIMaterial()))
         {
             rawImage.material = unlitDisplayMaterial;
             Debug.Log($"[DebugMaskLinker] (UpdateMaskTexture) Назначен кастомный материал '{unlitDisplayMaterial.name}' для RawImage.", gameObject);
         }
+        */ // --- END OLD MATERIAL LOGIC IN UPDATE ---
 
         Debug.Log($"[DebugMaskLinker] Получена маска в UpdateMaskTexture. IsNull: {mask == null}. Если не null, IsCreated: {(mask != null ? mask.IsCreated().ToString() : "N/A")}", gameObject);
 
@@ -136,6 +160,12 @@ public class DebugMaskLinker : MonoBehaviour
         {
             rawImage.enabled = true;
             Debug.Log("[DebugMaskLinker] Компонент RawImage был выключен, включен.", gameObject);
+        }
+
+        // Set the mask texture to the material if it's our custom material
+        if (rawImage.material != null && customMaskDisplayMaterial != null && rawImage.material.shader == customMaskDisplayMaterial.shader)
+        {
+            rawImage.material.SetTexture("_MainTex", mask);
         }
 
         updateCounter++;

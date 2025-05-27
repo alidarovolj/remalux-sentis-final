@@ -714,6 +714,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   unlitDisplayMaterial: {fileID: 2100000, guid: b5a14ec2309a74088908593b387f8e6f,
     type: 2}
+  customMaskDisplayMaterial: {fileID: 0}
 --- !u!1 &1967626619
 GameObject:
   m_ObjectHideFlags: 0
@@ -727,6 +728,7 @@ GameObject:
   - component: {fileID: 1967626620}
   - component: {fileID: 1967626623}
   - component: {fileID: 1967626624}
+  - component: {fileID: 1967626625}
   m_Layer: 0
   m_Name: ARManagers
   m_TagString: Untagged
@@ -761,6 +763,10 @@ MonoBehaviour:
   sharpenMaterial: {fileID: 2100000, guid: c10fe5024b58946caaaf25997ed05d11, type: 2}
   enableContrast: 1
   contrastMaterial: {fileID: 2100000, guid: 33e3db0e47a0e431e9cc1ad7b1539c5b, type: 2}
+  gaussianBlur3x3Material: {fileID: 2100000, guid: 2c70d88bbe63143cd96f655a6176fe11,
+    type: 2}
+  thresholdMaskMaterial: {fileID: 2100000, guid: b7f37c873e3d64dd4a33cf9554d1be69,
+    type: 2}
   detectFloor: 1
   inputResolution: {x: 640, y: 480}
   adaptiveResolution: 1
@@ -841,11 +847,11 @@ MonoBehaviour:
   arMeshManager: {fileID: 0}
   enableSceneReconstruction: 1
   arDirectionalLight: {fileID: 0}
-  useDetectedPlanes: 1
+  useDetectedPlanes: 0
   minPlaneSizeInMeters: 0.1
-  minPixelsDimensionForArea: 2
-  minAreaSizeInPixels: 10
-  wallAreaRedChannelThreshold: 30
+  minPixelsDimensionForLowResArea: 4
+  minAreaSizeInLowResPixels: 16
+  wallAreaRedChannelThreshold: 128
   enableDetailedRaycastLogging: 1
   maxRayDistance: 15
   hitLayerMask:
@@ -854,6 +860,7 @@ MonoBehaviour:
   minHitDistanceThreshold: 0.1
   maxWallNormalAngleDeviation: 30
   maxFloorCeilingAngleDeviation: 15
+  defaultPlaneDistance: 2.5
   planeLayerName: ARPlanes
   ignoreObjectNames: Player,UI,Hand
   usePersistentPlanes: 1
@@ -861,14 +868,14 @@ MonoBehaviour:
   persistentPlaneColor: {r: 0, g: 0.8, b: 0.2, a: 0.7}
   verticalPlaneMaterial: {fileID: 2100000, guid: 2d8bbbe4759fb0346b0c66902365902b,
     type: 2}
-  horizontalPlaneMaterial: {fileID: 7390553463975553142, guid: 7ab6f3b0fd1a6ba41b2a47766c16613f,
-    type: 3}
-  debugRayMaterial: {fileID: 0}
+  horizontalPlaneMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa,
+    type: 2}
+  debugRayMaterial: {fileID: 2100000, guid: 4b889361906f44446a7afbe53ad949f5, type: 2}
   enableRaycastClustering: 1
   clusteringMinHitsThreshold: 1
   planeConfigurator: {fileID: 1967626624}
   wallSegmentation: {fileID: 1967626620}
-  debugFlags: 0
+  debugFlags: 2
   selectedPlaneMaterial: {fileID: 0}
   paintMaterial: {fileID: 0}
 --- !u!4 &1967626622
@@ -939,6 +946,20 @@ MonoBehaviour:
   minAreaForPersistence: 0.3
   mergeOverlapThreshold: 0.5
   disablePlaneUpdatesAfterStabilization: 1
+  debugFlags: 0
+--- !u!114 &1967626625
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1967626619}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c9da0a9c2336c4a79b5f33a173d6bee4, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  currentColor: {r: 0, g: 0, b: 1, a: 1}
 --- !u!114 &2001374502 stripped
 MonoBehaviour:
   m_CorrespondingSourceObject: {fileID: 6402244310720262706, guid: 48cb3fb68c91eb94999fd99957eb0cae,
