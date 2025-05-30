@@ -7,7 +7,7 @@
 #pragma kernel ComprehensivePostProcess
 
 // Входные и выходные текстуры
-RWTexture2D<float4> InputMask;
+Texture2D<float4> InputMask;
 RWTexture2D<float4> PreviousMask;
 RWTexture2D<float4> OutputMask;
 RWTexture2D<float4> MotionVectors;

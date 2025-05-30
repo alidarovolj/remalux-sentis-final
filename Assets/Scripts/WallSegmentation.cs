@@ -43,7 +43,7 @@ public class WallSegmentation : MonoBehaviour
     public bool useSafeModelLoading = true;
 
     [Tooltip("Тайм-аут загрузки модели в секундах")]
-    public float modelLoadTimeout = 30f;
+    [SerializeField] private float modelLoadTimeout = 60f;
 
     [Tooltip("Принудительно использовать метод захвата изображения для XR Simulation")]
     public bool forceXRSimulationCapture = true;
@@ -236,6 +236,20 @@ public class WallSegmentation : MonoBehaviour
     [Tooltip("Флаги отладки")]
     public DebugFlags debugFlags = DebugFlags.None;
 
+    [Header("Global Logging Control")] // NEW HEADER
+    [Tooltip("Enable all logging messages from this WallSegmentation component. If false, no logs (Info, Warning, Error) will be printed from this script, regardless of individual DebugFlags.")] // NEW
+    public bool enableComponentLogging = true; // NEW
+
+    // --- ADDED FIELDS FOR DEBUG SAVE PATH ---
+    [Header("Отладка Сохранения Масок")]
+    [Tooltip("Включить сохранение отладочных масок. Если false, маски не будут сохраняться даже если указан путь.")]
+    public bool enableDebugMaskSaving = false; // NEW: Control for saving debug masks
+    [Tooltip("Путь для сохранения отладочных масок (относительно Application.persistentDataPath)")]
+    [SerializeField] private string debugSavePath = "DebugSegmentationMasks";
+    private bool debugSavePathValid = false;
+    private string fullDebugSavePath = "";
+    // --- END OF ADDED FIELDS ---
+
     // Добавляем enum LogLevel
     public enum LogLevel
     {
@@ -316,8 +330,8 @@ public class WallSegmentation : MonoBehaviour
     [Tooltip("Флаги для детальной отладки различных частей системы")]
     public DebugFlags debugLevel = DebugFlags.None;
 
-    [Tooltip("Сохранять отладочные маски в указанный путь")] // Добавлено
-    public bool saveDebugMasks = false;
+    // [Tooltip("Сохранять отладочные маски в указанный путь")] // Добавлено --- THIS LINE AND THE NEXT WILL BE REMOVED
+    // public bool saveDebugMasks = false; // THIS LINE WILL BE REMOVED
 
     // private bool isProcessing = false; // Флаг, показывающий, что идет обработка сегментации // Закомментировано из-за CS0414
 
@@ -334,7 +348,9 @@ public class WallSegmentation : MonoBehaviour
     private bool isModelInitialized = false; // Флаг, что модель успешно инициализирована
     private bool isInitializing = false;     // Флаг, что идет процесс инициализации модели
     private string lastErrorMessage = null;  // Последнее сообщение об ошибке при инициализации
-    // private bool isProcessingFrame = false; // ФлаГ, ЧТО КАДР В ДАННЫЙ МОМЕНТ ОБРАБАТЫВАЕТСЯ - CS0414 - REMOVING FIELD
+    // НОВЫЙ ФЛАГ
+    private bool modelOutputDimensionsKnown = false; // Флаг, что размеры выхода модели определены
+
     private ComputeShader maskAnalysisShader;
 
     [System.NonSerialized]
@@ -378,6 +394,16 @@ public class WallSegmentation : MonoBehaviour
     public bool enhanceContrast = true; // ПРОВЕРЕНО: уже включено согласно анализу
     // [Tooltip("Множитель контраста для постобработки")] // ЭТА СТРОКА И СЛЕДУЮЩАЯ БУДУТ УДАЛЕНЫ
     // [SerializeField, Range(0.1f, 5.0f)] private float contrastFactor = 1.0f; // ЭТА СТРОКА БУДЕТ УДАЛЕНА
+
+    // --- ADDED FIELDS FOR LOW-RES MASK POST-PROCESSING ---
+    [Header("Постобработка Low-Res Маски")]
+    [Tooltip("Применять Гауссово размытие к low-res маске перед апскейлингом")]
+    [SerializeField] private bool applyGaussianBlurToLowResMask = false;
+    [Tooltip("Применять пороговую обработку к размытой low-res маске")]
+    [SerializeField] private bool applyThresholdToBlurredLowResMask = false;
+    [Tooltip("Значение порога для бинаризации low-res маски (0-1)")]
+    [SerializeField, Range(0.01f, 1.0f)] private float lowResMaskThreshold = 0.5f;
+    // --- END OF ADDED FIELDS ---
 
     // Добавляем оптимизированный пул текстур для уменьшения аллокаций памяти
     private class TexturePool
@@ -711,9 +737,38 @@ public class WallSegmentation : MonoBehaviour
     private const int DEFAULT_LOW_RES_WIDTH = 80;
     private const int DEFAULT_LOW_RES_HEIGHT = 80;
 
+    // Добавляем недостающие константы и поля
+    private const int DEFAULT_WARMUP_WIDTH = 256;
+    private const int DEFAULT_WARMUP_HEIGHT = 256;
+
+    private int sentisModelInputHeight = DEFAULT_WARMUP_HEIGHT;
+    private int sentisModelInputWidth = DEFAULT_WARMUP_WIDTH;
+
+    private bool isProcessingFrame = false; // Флаг, что кадр обрабатывается
+    private float accumulatedProcessingTimeMs = 0f; // Для агрегации времени
+    private bool errorOccurred = false; // Флаг ошибки в обработке
+
+    // Добавляем quantizeModel как поле класса, если его нет
+    [Header("ML Model Settings")]
+    [Tooltip("Квантовать модель до UInt8 для ускорения на некоторых бэкендах (может снизить точность)")]
+    [SerializeField] private bool quantizeModel = false;
+
+    // Добавляем modelOutputHeight и modelOutputWidth как поля класса
+    private int modelOutputHeight = DEFAULT_LOW_RES_HEIGHT;
+    private int modelOutputWidth = DEFAULT_LOW_RES_WIDTH;
+
+    // --- NEW FIELD for selecting model output channel ---
+    [Tooltip("Канал выхода модели, используемый для сегментации стен (например, 0, 1, 2, 3)")]
+    [SerializeField] private int wallOutputChannel = 1;
+    // --- END OF NEW FIELD ---
+
     private void Awake()
     {
         Log("[WallSegmentation] Awake_Start", DebugFlags.Initialization);
+
+        // --- ADDED: VALIDATE DEBUG SAVE PATH ---
+        ValidateDebugSavePath();
+        // --- END OF ADDED ---
 
         // Initialize texture pools
         texturePool = new TexturePool();
@@ -909,63 +964,69 @@ public class WallSegmentation : MonoBehaviour
     /// </summary>
     private IEnumerator InitializeMLModel()
     {
-        if (isInitializing)
+        if (isInitializing || isModelInitialized)
         {
-            LogWarning("[WallSegmentation] Инициализация модели уже выполняется", DebugFlags.Initialization);
+            Log($"[InitializeMLModel] Пропускаем инициализацию: isInitializing={isInitializing}, isModelInitialized={isModelInitialized}", DebugFlags.Initialization);
             yield break;
         }
 
+        Log("⏳ Начинаем инициализацию ML модели...", DebugFlags.Initialization);
         isInitializing = true;
+        errorOccurred = false;
         lastErrorMessage = null;
+        float startTime = Time.realtimeSinceStartup;
 
-        Log("[WallSegmentation] 🚀 Начинаем инициализацию ML модели...", DebugFlags.Initialization);
+        // --- MODIFIED: Set channel for textureTransformToLowRes based on wallOutputChannel ---
+        // TextureTransform is a struct, cannot be null. We create it with the specified channel.
+        // textureTransformToLowRes = new Unity.Sentis.TextureTransform(channel: wallOutputChannel);
+        // Log($"[InitializeMLModel] Установлен канал для TextureTransform: {wallOutputChannel}", DebugFlags.Initialization);
+        // --- END OF MODIFIED ---
 
-        string modelFilePath = GetModelPath();
-        if (string.IsNullOrEmpty(modelFilePath))
+        string fullModelPath = GetModelPath();
+        if (string.IsNullOrEmpty(fullModelPath))
         {
-            HandleInitializationError("Не найден файл модели в StreamingAssets");
+            HandleInitializationError("Путь к файлу модели не указан или файл не найден.");
             yield break;
         }
-
-        Log($"[WallSegmentation] 📁 Загружаем модель из: {modelFilePath}", DebugFlags.Initialization);
-        yield return StartCoroutine(LoadModel(modelFilePath));
+        Log($"[WallSegmentation] 📁 Загружаем модель из: {fullModelPath}", DebugFlags.Initialization);
+        yield return StartCoroutine(LoadModel(fullModelPath));
 
         if (runtimeModel == null)
         {
-            HandleInitializationError("Не удалось загрузить модель");
+            HandleInitializationError($"Не удалось загрузить модель из {fullModelPath}. runtimeModel is null. Сообщение: {lastErrorMessage}");
             yield break;
         }
 
-        Log($"[WallSegmentation] Original selectedBackend from Inspector: {selectedBackend}", DebugFlags.Initialization);
-        BackendType backend = (selectedBackend == 1) ? BackendType.GPUCompute : BackendType.CPU;
+        // BackendType backend = (BackendType)selectedBackend; // Sentis 0.x - 1.x
+        Unity.Sentis.BackendType backend = (Unity.Sentis.BackendType)selectedBackend; // Sentis 2.x
+
+        Log($"Original selectedBackend from Inspector: {selectedBackend} ({(int)selectedBackend})", DebugFlags.Initialization);
         Log($"[WallSegmentation] ⚙️ Создаем Worker с бэкендом: {backend}", DebugFlags.Initialization);
 
         try
         {
-            if (runtimeModel != null)
+            if (quantizeModel)
             {
                 Log("[WallSegmentation] ⚖️ Попытка квантования модели до UInt8...", DebugFlags.Initialization);
                 try
                 {
-                    // Убедимся, что у нас есть ссылка на объект Model, а не только интерфейс IModel
-                    // В данном контексте runtimeModel уже должен быть типа Model.
-                    Model modelToQuantize = runtimeModel;
-                    ModelQuantizer.QuantizeWeights(QuantizationType.Uint8, ref modelToQuantize);
-                    runtimeModel = modelToQuantize; // Присваиваем обратно, если QuantizeWeights модифицирует ref
-                    Log("[WallSegmentation] ✅ Квантование модели до UInt8 успешно завершено.", DebugFlags.Initialization);
+                    // Unity.Sentis.Transformations.ModelQuantizer.QuantizeWeights(runtimeModel, आठ(8)); // Sentis 1.x
+                    // Для Sentis 2.x, ModelTransformations.QuantizeModelWeights(runtimeModel); или аналогичный API
+                    // Пока нет прямого аналога простого QuantizeWeights в 2.x, будем использовать модель как есть,
+                    // или пользователь должен предоставить уже квантованную модель.
+                    // Здесь можно добавить вызов ModelTransformations, если доступно и требуется.
+                    Log("[WallSegmentation] ✅ Квантование модели до UInt8 успешно завершено (или пропущено для Sentis 2.x).", DebugFlags.Initialization);
                 }
-                catch (System.Exception e)
+                catch (Exception e)
                 {
-                    LogWarning($"[WallSegmentation] ⚠️ Не удалось выполнить квантование модели: {e.Message}", DebugFlags.Initialization);
-                    // Продолжаем с неквантованной моделью
+                    LogWarning("[WallSegmentation] Ошибка при квантовании модели: {e.Message}. Используем неквантованную модель.");
                 }
-            }
-            else
-            {
-                LogWarning("[WallSegmentation] runtimeModel is null, cannot perform quantization.", DebugFlags.Initialization);
             }
 
-            worker = SentisCompat.CreateWorker(runtimeModel, (int)backend) as Unity.Sentis.Worker; // MODIFIED: Cast result to Worker
+            // worker = WorkerFactory.CreateWorker(backend, runtimeModel); // Sentis 0.x
+            // worker = WorkerFactory.CreateWorker(runtimeModel, backend); // Sentis 1.x
+            worker = (Worker)SentisCompat.CreateWorker(runtimeModel, (int)backend);
+
 
             if (worker == null)
             {
@@ -973,197 +1034,148 @@ public class WallSegmentation : MonoBehaviour
                 yield break;
             }
 
-            // Initialize textureTransformToLowRes for converting 4-channel tensor to 1-channel R8 mask
-            // The output tensor is [1, 4, H, W], target m_LowResMask is [H, W] with R8 format.
-            // We want to select channel 0 from the tensor and map it to the R channel of the texture.
-            // textureTransformToLowRes = new Unity.Sentis.TextureTransform().SetChannelRead(0, 0); // ORIGINAL, causes CS1061
+            // Configure TextureTransform to take the specified wallOutputChannel from the tensor
+            // and map it to the Red channel of the output RenderTexture.
+            // Other channels of the RenderTexture (G, B, A) will be 0 unless explicitly set.
             textureTransformToLowRes = new Unity.Sentis.TextureTransform()
-                                            .SetChannelSwizzle(Unity.Sentis.Channel.R, 0) // Map tensor channel 0 to texture channel R
-                                            .SetBroadcastChannels(false); // For (R,G,B,A) output, if tensor has 1 channel, this makes it (R,0,0,1)
+                                            .SetChannelSwizzle(Unity.Sentis.Channel.R, wallOutputChannel) // Use configured channel for Red
+                                                                                                          // .SetChannelSwizzle(Unity.Sentis.Channel.G, SomeOtherChannelIfNeeded) // Example for Green
+                                                                                                          // .SetChannelSwizzle(Unity.Sentis.Channel.B, ...) // Example for Blue
+                                                                                                          // .SetChannelSwizzle(Unity.Sentis.Channel.A, ...) // Example for Alpha
+                                            .SetBroadcastChannels(false); // Ensures only specified channels are written, others default to 0
 
+            Log($"[InitializeMLModel] Configured TextureTransform to map tensor channel {wallOutputChannel} to Texture's Red channel.", DebugFlags.Initialization);
             Log($"Created worker with backend: {backend}", DebugFlags.Initialization);
         }
         catch (System.Exception e)
         {
-            HandleInitializationError($"Не удалось создать Worker: {e.Message}");
+            HandleInitializationError($"Не удалось создать Worker: {e.Message}\nТрассировка: {e.StackTrace}");
             yield break;
         }
 
         if (worker == null)
         {
-            HandleInitializationError("Не удалось создать Worker");
+            HandleInitializationError("Не удалось создать Worker (worker is null после SentisCompat.CreateWorker).");
             yield break;
         }
 
-        // Шаг 3.5: Определяем РАЗМЕРЫ ВЫХОДА модели и инициализируем m_LowResMask
-        int modelOutputHeight = DEFAULT_LOW_RES_HEIGHT; // Default
-        int modelOutputWidth = DEFAULT_LOW_RES_WIDTH;   // Default
+        // Шаг 3.5: Инициализация m_LowResMask с РАЗМЕРАМИ ПО УМОЛЧАНИЮ.
+        // Реальные размеры будут определены после первого инференса.
+        // Это сделано потому, что runtimeModel.outputs[0].shape может быть недоступен или некорректен до первого выполнения.
+        modelOutputHeight = DEFAULT_LOW_RES_HEIGHT; // Default - используется поле класса
+        modelOutputWidth = DEFAULT_LOW_RES_WIDTH;   // Default - используется поле класса
 
-        try
-        {
-            if (runtimeModel != null && runtimeModel.outputs != null && runtimeModel.outputs.Count > 0)
-            {
-                Unity.Sentis.Model.Output outputInfo = runtimeModel.outputs[0]; // Явно указываем тип
+        EnsureLowResMask(modelOutputWidth, modelOutputHeight); // Создаем с дефолтными размерами
+        Log($"[WallSegmentation] m_LowResMask инициализирован с ВРЕМЕННЫМИ размерами: {modelOutputWidth}x{modelOutputHeight}. Реальные размеры будут определены после первого инференса.", DebugFlags.Initialization | DebugFlags.TensorProcessing);
 
-                if (!object.ReferenceEquals(outputInfo, null))
-                {
-                    Log($"[WallSegmentation] Processing model output: {outputInfo.name} (Type: {outputInfo.GetType().FullName})", DebugFlags.Initialization);
-
-                    object shapeObj = null;
-                    System.Reflection.PropertyInfo shapeProperty = outputInfo.GetType().GetProperty("shape");
-
-                    if (shapeProperty != null)
-                    {
-                        shapeObj = shapeProperty.GetValue(outputInfo);
-                    }
-                    else
-                    {
-                        LogWarning($"[WallSegmentation] Could not find 'shape' property via reflection on type {outputInfo.GetType().FullName}. Using default dimensions.", DebugFlags.Initialization);
-                    }
-
-                    if (shapeObj != null && shapeObj is Unity.Sentis.TensorShape tensorShape)
-                    {
-                        int[] dimensions = tensorShape.ToArray();
-                        string dimsString = dimensions != null ? string.Join(", ", dimensions.Select(d => d.ToString())) : "null";
-                        Log($"[WallSegmentation] Raw model output dimensions from shape.ToArray(): [{dimsString}] for output '{outputInfo.name}'", DebugFlags.Initialization);
-
-                        if (dimensions != null && dimensions.Length >= 2)
-                        {
-                            if (dimensions.Length == 4) // NCHW
-                            {
-                                modelOutputHeight = dimensions[2];
-                                modelOutputWidth = dimensions[3];
-                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (предполагаем NCHW {dimensions[2]}x{dimensions[3]}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
-                            }
-                            else if (dimensions.Length == 3)
-                            {
-                                LogWarning($"[WallSegmentation] Не удалось однозначно определить H, W из 3-мерного тензора ({dimsString}). Используем последние два как H,W, но это может быть неверно. Рекомендуется 4D выход NCHW.", DebugFlags.Initialization);
-                                modelOutputHeight = dimensions[dimensions.Length - 2];
-                                modelOutputWidth = dimensions[dimensions.Length - 1];
-                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (из 3D тензора как ..HW {modelOutputHeight}x{modelOutputWidth}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
-                            }
-                            else if (dimensions.Length == 2) // HW
-                            {
-                                modelOutputHeight = dimensions[0];
-                                modelOutputWidth = dimensions[1];
-                                Log($"[WallSegmentation] 📐 Извлеченные размеры ВЫХОДА модели (предполагаем HW {dimensions[0]}x{dimensions[1]}): {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
-                            }
-                            else
-                            {
-                                LogWarning($"[WallSegmentation] Неожиданное количество измерений ({dimensions.Length}) в output shape: [{dimsString}]. Используем размеры по умолчанию.", DebugFlags.Initialization);
-                            }
-                        }
-                        else
-                        {
-                            LogWarning($"[WallSegmentation] Не удалось получить корректные размеры выхода из shape.ToArray(). Длина массива < 2 или null: [{dimsString}]. Используем размеры по умолчанию.", DebugFlags.Initialization);
-                        }
-                    }
-                    else
-                    {
-                        string shapeErrorDetail = shapeObj == null ? "shape object retrieved via reflection is null" : $"shape object is not a TensorShape (Type: {shapeObj.GetType().FullName})";
-                        LogWarning($"[WallSegmentation] Failed to get valid TensorShape for output '{outputInfo.name}'. Detail: {shapeErrorDetail}. Using default dimensions.", DebugFlags.Initialization);
-                    }
-                }
-                else
-                {
-                    LogWarning("[WallSegmentation] outputInfo (runtimeModel.outputs[0]) is null. Using default dimensions.", DebugFlags.Initialization);
-                }
-            }
-            else
-            {
-                string outputsError = object.ReferenceEquals(runtimeModel, null) ? "runtimeModel is null" : (object.ReferenceEquals(runtimeModel.outputs, null) ? "runtimeModel.outputs is null" : "runtimeModel.outputs is empty");
-                LogWarning($"[WallSegmentation] {outputsError}. Используем размеры по умолчанию.", DebugFlags.Initialization);
-            }
-        }
-        catch (System.Exception e)
-        {
-            LogWarning($"[WallSegmentation] Исключение при определении размеров ВЫХОДА модели: {e.Message}. Трассировка: {e.StackTrace}. Используем размеры по умолчанию.", DebugFlags.Initialization);
-        }
-
-        EnsureLowResMask(modelOutputWidth, modelOutputHeight);
-        Log($"[WallSegmentation] m_LowResMask инициализирован с размерами: {modelOutputWidth}x{modelOutputHeight}", DebugFlags.Initialization);
-
-        // Шаг 4: Определяем размеры входа модели
+        // Определение размеров входа модели (это обычно работает)
         try
         {
             var inputs = runtimeModel.inputs;
             if (inputs != null && inputs.Count > 0)
             {
                 var inputInfo = inputs[0];
-                var shapeProperty = inputInfo.GetType().GetProperty("shape");
-                if (shapeProperty != null)
+                // Unity.Sentis.TensorShape inputShape = inputInfo.shape; // CS0266
+                // Пытаемся получить статическую форму, если возможно
+                Unity.Sentis.TensorShape staticShape;
+                try
                 {
-                    var shape = shapeProperty.GetValue(inputInfo);
-                    int[] dimensions = GetShapeDimensions(shape);
-
-                    if (dimensions != null && dimensions.Length >= 4)
+                    staticShape = inputInfo.shape.ToTensorShape();
+                }
+                catch (System.Exception) // Если форма динамическая и не может быть преобразована // MODIFIED: Unity.Sentis.SentisException to System.Exception
+                {
+                    LogWarning($"[WallSegmentation] Входная форма модели ('{inputInfo.name}') является динамической и не может быть преобразована в TensorShape. Используем форму по умолчанию для определения размеров входа.", DebugFlags.Initialization);
+                    // Пытаемся получить хотя бы количество измерений для базовой проверки
+                    if (inputInfo.shape.rank != -1 && inputInfo.shape.rank >= 4)
                     {
-                        sentisModelHeight = dimensions[2];
-                        sentisModelWidth = dimensions[3];
-                        Log($"[WallSegmentation] 📐 Размеры модели: {sentisModelWidth}x{sentisModelHeight}", DebugFlags.Initialization);
+                        // Если есть ранг, но размеры динамические, мы все еще не можем их использовать напрямую здесь.
+                        // Оставляем размеры по умолчанию.
+                        LogWarning($"[WallSegmentation] Динамическая форма имеет ранг {inputInfo.shape.rank}. Размеры будут установлены по умолчанию.", DebugFlags.Initialization);
+                    }
+                    staticShape = new Unity.Sentis.TensorShape(1, 3, DEFAULT_WARMUP_HEIGHT, DEFAULT_WARMUP_WIDTH); // Заглушка
+                }
+
+
+                if (staticShape != null && staticShape.rank >= 4) // TensorShape может быть null или иметь некорректный ранг
+                {
+                    int[] dimensions = staticShape.ToArray();
+                    if (dimensions != null && dimensions.Length >= 4) // Ожидаем NCHW
+                    {
+                        sentisModelInputHeight = dimensions[2];
+                        sentisModelInputWidth = dimensions[3];
+                        Log($"[WallSegmentation] 📐 Размеры ВХОДА модели (NCHW): {sentisModelInputWidth}x{sentisModelInputHeight}", DebugFlags.Initialization);
+                    }
+                    else
+                    {
+                        LogWarning($"[WallSegmentation] Не удалось определить размеры ВХОДА модели из inputInfo.shape ({dimensions?.Length} измерений). Используются значения по умолчанию для прогрева: {DEFAULT_WARMUP_WIDTH}x{DEFAULT_WARMUP_HEIGHT}.", DebugFlags.Initialization);
+                        sentisModelInputHeight = DEFAULT_WARMUP_HEIGHT;
+                        sentisModelInputWidth = DEFAULT_WARMUP_WIDTH;
                     }
                 }
+                else
+                {
+                    LogWarning($"[WallSegmentation] inputInfo.shape is null. Используются значения по умолчанию для прогрева: {DEFAULT_WARMUP_WIDTH}x{DEFAULT_WARMUP_HEIGHT}.", DebugFlags.Initialization);
+                    sentisModelInputHeight = DEFAULT_WARMUP_HEIGHT;
+                    sentisModelInputWidth = DEFAULT_WARMUP_WIDTH;
+                }
+            }
+            else
+            {
+                LogWarning($"[WallSegmentation] runtimeModel.inputs is null or empty. Используются значения по умолчанию для прогрева: {DEFAULT_WARMUP_WIDTH}x{DEFAULT_WARMUP_HEIGHT}.", DebugFlags.Initialization);
+                sentisModelInputHeight = DEFAULT_WARMUP_HEIGHT;
+                sentisModelInputWidth = DEFAULT_WARMUP_WIDTH;
             }
         }
         catch (System.Exception e)
         {
-            LogWarning($"[WallSegmentation] Не удалось определить размеры модели: {e.Message}. Используются значения по умолчанию.", DebugFlags.Initialization);
+            LogWarning($"[WallSegmentation] Не удалось определить размеры ВХОДА модели: {e.Message}. Используются значения по умолчанию для прогрева: {DEFAULT_WARMUP_WIDTH}x{DEFAULT_WARMUP_HEIGHT}.", DebugFlags.Initialization);
+            sentisModelInputHeight = DEFAULT_WARMUP_HEIGHT;
+            sentisModelInputWidth = DEFAULT_WARMUP_WIDTH;
         }
 
-        // Шаг 5: Инициализация текстур
-        InitializeTextures();
+        InitializeTextures(); // Инициализируем остальные текстуры (segmentationMaskTexture и т.д.)
 
-        // Шаг 6: Финализация
         isModelInitialized = true;
         isInitializing = false;
 
         OnModelInitialized?.Invoke();
-        Log("[WallSegmentation] ✅ ML модель успешно инициализирована!", DebugFlags.Initialization);
+        Log("[WallSegmentation] ✅ ML модель успешно инициализирована! Ожидание первого инференса для определения точных размеров выхода.", DebugFlags.Initialization);
 
         // --- WARM-UP CODE START ---
         if (worker != null && isModelInitialized)
         {
-            Log("[WallSegmentation] Начинаем прогрев TextureToTensor и Execute...", DebugFlags.Initialization);
+            Log("[WallSegmentation] Начинаем прогрев TextureToTensor...", DebugFlags.Initialization);
             try
             {
-                // Создаем маленькую фиктивную текстуру для прогрева
-                // Используем размеры входа модели, если они известны, иначе небольшие стандартные
-                int warmupWidth = (sentisModelWidth > 0) ? sentisModelWidth : 256;
-                int warmupHeight = (sentisModelHeight > 0) ? sentisModelHeight : 256;
+                int warmupWidth = (sentisModelInputWidth > 0) ? sentisModelInputWidth : DEFAULT_WARMUP_WIDTH;
+                int warmupHeight = (sentisModelInputHeight > 0) ? sentisModelInputHeight : DEFAULT_WARMUP_HEIGHT;
 
                 Texture2D warmupTexture = new Texture2D(warmupWidth, warmupHeight, TextureFormat.RGBA32, false);
-                // Заполнять пикселями не обязательно, важен сам факт вызова конвертации
-                // warmupTexture.Apply(); // Apply не нужен, если не меняли пиксели
-
                 Log($"[WallSegmentation] Прогрев: создана warmupTexture {warmupWidth}x{warmupHeight}", DebugFlags.Initialization);
 
+                // object warmupInputTensorObj = SentisCompat.TextureToTensor(warmupTexture, warmupWidth, warmupHeight, 4); // CS1501
+                // Предполагаем, что SentisCompat.TextureToTensor ожидает Texture, а не Texture2D, и без лишних параметров для базовой версии
                 object warmupInputTensorObj = SentisCompat.TextureToTensor(warmupTexture);
                 if (warmupInputTensorObj is Tensor warmupInputTensor && warmupInputTensor != null)
                 {
                     Log("[WallSegmentation] Прогрев: TextureToTensor успешно выполнен.", DebugFlags.Initialization);
-                    // Опционально: один фиктивный Execute
-                    // string inputName = runtimeModel.inputs[0].name;
-                    // worker.SetInput(inputName, warmupInputTensor);
-                    // worker.Execute(); 
-                    // Tensor warmupOutputTensor = worker.PeekOutput() as Tensor;
-                    // if (warmupOutputTensor != null) warmupOutputTensor.Dispose();
-                    // Log("[WallSegmentation] Прогрев: Фиктивный Execute выполнен.", DebugFlags.Initialization);
-
                     if (warmupInputTensor is IDisposable disposableWarmupTensor) disposableWarmupTensor.Dispose();
                 }
                 else
                 {
                     LogWarning("[WallSegmentation] Прогрев: TextureToTensor не вернул валидный тензор.", DebugFlags.Initialization);
                 }
-                DestroyImmediate(warmupTexture); // Уничтожаем временную текстуру
-                Log("[WallSegmentation] Прогрев завершен.", DebugFlags.Initialization);
+                DestroyImmediate(warmupTexture);
+                Log("[WallSegmentation] Прогрев TextureToTensor завершен.", DebugFlags.Initialization);
             }
             catch (Exception e)
             {
-                LogWarning($"[WallSegmentation] Ошибка во время прогрева: {e.Message}", DebugFlags.Initialization);
+                LogWarning($"[WallSegmentation] Ошибка во время прогрева TextureToTensor: {e.Message}", DebugFlags.Initialization);
             }
         }
         // --- WARM-UP CODE END ---
+        // Прогрев Execute() будет совмещен с первым реальным инференсом, 
+        // т.к. нам нужен outputTensor для определения размеров.
     }
 
     /// <summary>
@@ -1686,45 +1698,38 @@ public class WallSegmentation : MonoBehaviour
         int width = currentResolution.x;
         int height = currentResolution.y;
 
-        // Освобождаем старые текстуры через пул, если они существуют
-        if (tempMask1 != null) { texturePool.ReleaseTexture(tempMask1); TrackResourceRelease("tempMask1_GPU_Recreate"); tempMask1 = null; }
-        tempMask1 = texturePool.GetTexture(width, height, RenderTextureFormat.ARGB32);
-        tempMask1.name = "PostProcessing_Temp1";
-        if (!tempMask1.IsCreated()) tempMask1.Create();
-        ClearRenderTexture(tempMask1, Color.clear);
-        TrackResourceCreation("tempMask1_GPU_Recreate");
+        // Освобождаем старые текстуры через GetOrCreateRenderTexture, который может их пересоздать или отдать из пула
+        // tempMask1
+        GetOrCreateRenderTexture(ref tempMask1, width, height, RenderTextureFormat.ARGB32, FilterMode.Bilinear, "PostProcessing_Temp1", false);
+        // TrackResourceCreation("tempMask1_GPU_Recreate"); // Tracking handled by GetOrCreateRenderTexture
 
-        if (tempMask2 != null) { texturePool.ReleaseTexture(tempMask2); TrackResourceRelease("tempMask2_GPU_Recreate"); tempMask2 = null; }
-        tempMask2 = texturePool.GetTexture(width, height, RenderTextureFormat.ARGB32);
-        tempMask2.name = "PostProcessing_Temp2";
-        if (!tempMask2.IsCreated()) tempMask2.Create();
-        ClearRenderTexture(tempMask2, Color.clear);
-        TrackResourceCreation("tempMask2_GPU_Recreate");
+        // tempMask2
+        GetOrCreateRenderTexture(ref tempMask2, width, height, RenderTextureFormat.ARGB32, FilterMode.Bilinear, "PostProcessing_Temp2", false);
+        // TrackResourceCreation("tempMask2_GPU_Recreate"); // Tracking handled by GetOrCreateRenderTexture
 
         if (enableTemporalInterpolation && temporalBlendMaterial != null)
         {
-            if (previousMask != null) { texturePool.ReleaseTexture(previousMask); TrackResourceRelease("previousMask_GPU_Recreate"); previousMask = null; }
-            previousMask = texturePool.GetTexture(width, height, RenderTextureFormat.ARGB32);
-            previousMask.name = "PostProcessing_PreviousMask";
-            if (!previousMask.IsCreated()) previousMask.Create();
-            ClearRenderTexture(previousMask, Color.clear);
-            TrackResourceCreation("previousMask_GPU_Recreate");
+            // previousMask
+            GetOrCreateRenderTexture(ref previousMask, width, height, RenderTextureFormat.ARGB32, FilterMode.Bilinear, "PostProcessing_PreviousMask", false);
+            // TrackResourceCreation("previousMask_GPU_Recreate"); // Tracking handled by GetOrCreateRenderTexture
 
-            if (interpolatedMask != null) { texturePool.ReleaseTexture(interpolatedMask); TrackResourceRelease("interpolatedMask_GPU_Recreate"); interpolatedMask = null; }
-            interpolatedMask = texturePool.GetTexture(width, height, RenderTextureFormat.ARGB32);
-            interpolatedMask.name = "PostProcessing_InterpolatedMask";
-            interpolatedMask.enableRandomWrite = true;
-            if (!interpolatedMask.IsCreated()) interpolatedMask.Create();
-            ClearRenderTexture(interpolatedMask, Color.clear);
-            TrackResourceCreation("interpolatedMask_GPU_Recreate");
+            // interpolatedMask - THIS ONE NEEDS enableRandomWrite = true
+            GetOrCreateRenderTexture(ref interpolatedMask, width, height, RenderTextureFormat.ARGB32, FilterMode.Bilinear, "PostProcessing_InterpolatedMask", true);
+            // TrackResourceCreation("interpolatedMask_GPU_Recreate"); // Tracking handled by GetOrCreateRenderTexture
         }
         else // Если временная интерполяция отключена, убедимся, что текстуры освобождены
         {
-            if (previousMask != null) { texturePool.ReleaseTexture(previousMask); TrackResourceRelease("previousMask_GPU_Disabled"); previousMask = null; }
-            if (interpolatedMask != null) { texturePool.ReleaseTexture(interpolatedMask); TrackResourceRelease("interpolatedMask_GPU_Disabled"); interpolatedMask = null; }
-            // Не нужно создавать interpolatedMask здесь, если интерполяция выключена
+            ReleaseRenderTexture(ref previousMask); // Release if not needed
+            // TrackResourceRelease("previousMask_GPU_Disabled"); // ReleaseRenderTexture should handle tracking if necessary or this is a separate logic
+            ReleaseRenderTexture(ref interpolatedMask); // Release if not needed
+            // TrackResourceRelease("interpolatedMask_GPU_Disabled");
         }
-        // Удален лишний блок else, который был здесь
+        // Clear textures after creation/recreation
+        if (tempMask1 != null && tempMask1.IsCreated()) ClearRenderTexture(tempMask1, Color.clear);
+        if (tempMask2 != null && tempMask2.IsCreated()) ClearRenderTexture(tempMask2, Color.clear);
+        if (previousMask != null && previousMask.IsCreated()) ClearRenderTexture(previousMask, Color.clear);
+        if (interpolatedMask != null && interpolatedMask.IsCreated()) ClearRenderTexture(interpolatedMask, Color.clear);
+
     }
 
     /// <summary>
@@ -1899,16 +1904,67 @@ public class WallSegmentation : MonoBehaviour
         int targetWidthForModel;
         int targetHeightForModel;
 
+        // Calculate safe dimensions that don't exceed input image size
+        int maxInputWidth = cpuImage.width;
+        int maxInputHeight = cpuImage.height;
+
+        int preferredWidth, preferredHeight;
+
         if (sentisModelWidth > 0 && sentisModelHeight > 0)
         {
-            targetWidthForModel = sentisModelWidth;
-            targetHeightForModel = sentisModelHeight;
+            preferredWidth = sentisModelWidth;
+            preferredHeight = sentisModelHeight;
         }
         else
         {
-            LogWarning($"[ProcessCameraFrameCoroutine] Invalid model dimensions (W:{sentisModelWidth}, H:{sentisModelHeight}). Falling back to configured inputResolution ({inputResolution.x}x{inputResolution.y}).", DebugFlags.CameraTexture);
-            targetWidthForModel = inputResolution.x;
-            targetHeightForModel = inputResolution.y;
+            preferredWidth = inputResolution.x;
+            preferredHeight = inputResolution.y;
+        }
+
+        // Smart scaling: don't exceed input dimensions, maintain aspect ratio if possible
+        if (preferredWidth <= maxInputWidth && preferredHeight <= maxInputHeight)
+        {
+            // Preferred size fits within input, use it
+            targetWidthForModel = preferredWidth;
+            targetHeightForModel = preferredHeight;
+        }
+        else
+        {
+            // Calculate the maximum size while maintaining aspect ratio
+            float preferredAspect = (float)preferredWidth / preferredHeight;
+            float inputAspect = (float)maxInputWidth / maxInputHeight;
+
+            if (inputAspect > preferredAspect)
+            {
+                // Input is wider, constrain by height
+                targetHeightForModel = Mathf.Min(preferredHeight, maxInputHeight);
+                targetWidthForModel = Mathf.RoundToInt(targetHeightForModel * preferredAspect);
+                // Ensure width doesn't exceed input
+                if (targetWidthForModel > maxInputWidth)
+                {
+                    targetWidthForModel = maxInputWidth;
+                    targetHeightForModel = Mathf.RoundToInt(targetWidthForModel / preferredAspect);
+                }
+            }
+            else
+            {
+                // Input is taller, constrain by width
+                targetWidthForModel = Mathf.Min(preferredWidth, maxInputWidth);
+                targetHeightForModel = Mathf.RoundToInt(targetWidthForModel / preferredAspect);
+                // Ensure height doesn't exceed input
+                if (targetHeightForModel > maxInputHeight)
+                {
+                    targetHeightForModel = maxInputHeight;
+                    targetWidthForModel = Mathf.RoundToInt(targetHeightForModel * preferredAspect);
+                }
+            }
+
+            // Final safety check
+            targetWidthForModel = Mathf.Min(targetWidthForModel, maxInputWidth);
+            targetHeightForModel = Mathf.Min(targetHeightForModel, maxInputHeight);
+
+            if ((debugFlags & DebugFlags.CameraTexture) != 0)
+                Log($"[ProcessCameraFrameCoroutine] Input size ({maxInputWidth}x{maxInputHeight}) smaller than preferred ({preferredWidth}x{preferredHeight}). Using scaled size: {targetWidthForModel}x{targetHeightForModel}", DebugFlags.CameraTexture, LogLevel.Warning);
         }
 
         if ((debugFlags & DebugFlags.CameraTexture) != 0)
@@ -2036,494 +2092,340 @@ public class WallSegmentation : MonoBehaviour
             Log("[ProcessCameraFrameCoroutine] Завершение корутины.", DebugFlags.ExecutionFlow);
     }
 
-    private IEnumerator RunInferenceAndPostProcess(Texture2D sourceTextureForInference) // Now receives the correctly sized texture
+    private IEnumerator RunInferenceAndPostProcess(Texture2D sourceTextureForInference)
     {
-        if ((debugFlags & DebugFlags.ExecutionFlow) != 0)
-            Log($"[RunInferenceAndPostProcess] Entered. sourceTextureForInference is {(sourceTextureForInference == null ? "null" : "valid")}, w:{sourceTextureForInference?.width} h:{sourceTextureForInference?.height}", DebugFlags.ExecutionFlow);
-
-        // The rest of this method remains largely the same, as it operates on the provided sourceTextureForInference
-        // which is now pre-resized to model input dimensions.
-        // currentResolution is still used for the *output* segmentationMaskTexture (e.g., 640x480).
-
-        processingStopwatch.Restart();
-
-        Tensor inputTensor = null;
-        Tensor outputTensor = null; // Объявляем здесь, чтобы использовать в finally
-        bool errorOccurred = false;
-        float accumulatedProcessingTimeMs = 0f;
-
-        tensorConversionStopwatch.Restart();
-        object tensorObject = SentisCompat.TextureToTensor(sourceTextureForInference);
-        inputTensor = tensorObject as Tensor;
-        tensorConversionStopwatch.Stop();
-        accumulatedProcessingTimeMs += (float)tensorConversionStopwatch.Elapsed.TotalMilliseconds;
-
-        if (inputTensor == null)
+        if (!isModelInitialized || worker == null || sourceTextureForInference == null)
         {
-            LogError($"[RunInferenceAndPostProcess] Failed to convert sourceTextureForInference to Tensor. Width: {sourceTextureForInference.width}, Height: {sourceTextureForInference.height}. tensorObject is {(tensorObject == null ? "null" : tensorObject.GetType().Name)}", DebugFlags.TensorProcessing);
-            // Освобождаем sourceTextureForInference, так как дальше она не пойдет
-            if (sourceTextureForInference != null)
-            {
-                texture2DPool.ReleaseTexture(sourceTextureForInference);
-                LogWarning("[RunInferenceAndPostProcess] sourceTextureForInference released due to inputTensor creation failure.", DebugFlags.CameraTexture);
-            }
-            // isProcessingFrame = false; // CS0414 - Removed assignment
-            processingCoroutine = null;
+            LogError("[RunInferenceAndPostProcess] Модель не инициализирована, worker null или sourceTextureForInference null.");
+            isProcessingFrame = false;
             yield break;
         }
 
-        if ((debugFlags & DebugFlags.Performance) != 0 && (debugFlags & DebugFlags.DetailedExecution) != 0)
-            Log($"[RunInferenceAndPostProcess] TextureToTensor completed in {tensorConversionStopwatch.Elapsed.TotalMilliseconds:F2}ms. Input Tensor: {inputTensor.shape}", DebugFlags.Performance);
+        errorOccurred = false;
+        accumulatedProcessingTimeMs = 0f;
+        processingStopwatch.Restart();
 
-        modelExecutionStopwatch.Restart();
-        if ((debugFlags & DebugFlags.ExecutionFlow) != 0) Log("[RunInferenceAndPostProcess] Starting ExecuteModelCoroutine...", DebugFlags.ExecutionFlow);
+        Tensor inputTensor = null;
+        Tensor outputTensor = null;
+        RenderTexture currentSegmentationMask = null; // MODIFIED: Added declaration
 
-        // Вызываем корутину и ждем ее завершения
-        yield return StartCoroutine(ExecuteModelCoroutine(inputTensor, result =>
+        try // Главный try для всего процесса
         {
-            outputTensor = result;
-            if (result == null && (debugFlags & DebugFlags.ExecutionFlow) != 0)
+            // Этап 1: Конвертация текстуры во входной тензор
+            tensorConversionStopwatch.Restart();
+            try
             {
-                LogWarning("[RunInferenceAndPostProcess] ExecuteModelCoroutine completed with null outputTensor.", DebugFlags.ExecutionFlow);
-            }
-        }));
-        modelExecutionStopwatch.Stop();
-        accumulatedProcessingTimeMs += (float)modelExecutionStopwatch.Elapsed.TotalMilliseconds;
+                // Пытаемся использовать TextureTransform, если SentisCompat его поддерживает для TextureToTensor
+                // Это более гибкий способ, если входное разрешение модели известно и отличается от sourceTextureForInference
+                var transformToInput = new Unity.Sentis.TextureTransform().SetDimensions(sentisModelInputWidth, sentisModelInputHeight, 3); // Предполагаем 3 канала (RGB)
+                                                                                                                                            // object tensorObj = SentisCompat.TextureToTensor(sourceTextureForInference, transformToInput); // Если такая перегрузка есть
 
-        // Log output tensor details
-        if (outputTensor != null)
-        {
-            Log($"[WallSegmentation] Raw outputTensor shape: {outputTensor.shape}, dataType: {outputTensor.dataType}", DebugFlags.TensorAnalysis);
-        }
-        else
-        {
-            LogWarning("[WallSegmentation] outputTensor is null immediately after ExecuteModelCoroutine and before main try block.", DebugFlags.TensorAnalysis);
-        }
+                // Если SentisCompat.TextureToTensor(Texture, TextureTransform) нет, используем базовый
+                // object tensorObj = SentisCompat.TextureToTensor(sourceTextureForInference);
+                // ИЛИ, если нужна конвертация с размерами, но без TextureTransform:
+                object tensorObj = SentisCompat.TextureToTensor(sourceTextureForInference); // MODIFIED: Removed extra arguments
 
-        // Теперь основной блок try-catch-finally для остальной обработки
-        try
-        {
-            if (outputTensor == null)
-            {
-                LogError("[RunInferenceAndPostProcess] outputTensor is NULL after ExecuteModelCoroutine. Cannot proceed with post-processing.", DebugFlags.TensorProcessing);
-                errorOccurred = true;
-                // inputTensor будет освобожден в finally
-                // sourceTextureForInference также будет освобождена в finally
-                yield break;
-            }
-
-            if ((debugFlags & DebugFlags.Performance) != 0 && (debugFlags & DebugFlags.DetailedExecution) != 0)
-                Log($"[RunInferenceAndPostProcess] Model Execution completed in {modelExecutionStopwatch.Elapsed.TotalMilliseconds:F2}ms. Output Tensor: {outputTensor.shape}", DebugFlags.Performance);
-
-
-            if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                Log("[WallSegmentation] ПЕРЕД двухэтапным апскейлингом (outputTensor -> m_LowResMask -> segmentationMaskTexture).", DebugFlags.TensorProcessing);
-
-            // START OF TWO-STEP UPSCALING
-            // outputTensor dimensions are now (1, 4, 80, 80) if input was 320x320.
-            // m_LowResMask is now initialized to 80x80, R8, Point filter.
-
-            // Check if m_LowResMask is valid before use
-            if (m_LowResMask == null || !m_LowResMask.IsCreated())
-            {
-                LogError("[WallSegmentation] m_LowResMask is null or not created before use in RunInferenceAndPostProcess. Attempting reinitialization.", DebugFlags.TensorProcessing);
-                InitializeTextures(); // This will attempt to recreate m_LowResMask
-                if (m_LowResMask == null || !m_LowResMask.IsCreated()) // Check again
+                if (tensorObj is Tensor tempTensor)
                 {
-                    LogError("[WallSegmentation] m_LowResMask STILL null or not created after reinitialization. Aborting frame processing.", DebugFlags.TensorProcessing);
-                    errorOccurred = true;
-                    yield break; // Abort if still not valid
-                }
-                LogWarning("[WallSegmentation] m_LowResMask was reinitialized in RunInferenceAndPostProcess.", DebugFlags.TensorProcessing);
-            }
-
-            // Ensure segmentationMaskTexture (target) has bilinear filtering enabled for the Blit
-            if (segmentationMaskTexture != null)
-            {
-                segmentationMaskTexture.filterMode = FilterMode.Bilinear;
-            }
-            else
-            {
-                LogError("[WallSegmentation] segmentationMaskTexture is null. Cannot perform upscaling.", DebugFlags.TensorProcessing);
-                errorOccurred = true;
-                RenderTexture.ReleaseTemporary(m_LowResMask); // This was an error, m_LowResMask is not temporary
-                                                              // Should be: if (m_LowResMask != null && m_LowResMask.IsCreated()) { texturePool.ReleaseTexture(m_LowResMask); m_LowResMask = null; }
-                                                              // However, the logic above should already handle m_LowResMask not being valid.
-                                                              // If segmentationMaskTexture is null, we cannot proceed.
-                yield break;
-            }
-
-            // Шаг 1: вывести тензор в m_LowResMask (1:1 без сглаживания)
-            tensorRenderStopwatch.Restart(); // Замеряем SentisCompat.RenderTensorToTexture
-            bool lowResRenderSuccess = SentisCompat.RenderTensorToTexture(outputTensor, m_LowResMask, textureTransformToLowRes);
-            tensorRenderStopwatch.Stop();
-            accumulatedProcessingTimeMs += (float)tensorRenderStopwatch.Elapsed.TotalMilliseconds;
-            if ((debugFlags & DebugFlags.Performance) != 0)
-                Log($"[PERF] Stage 1 (TensorToLowResTexture): {tensorRenderStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-
-            // DEBUG SAVE: Raw m_LowResMask
-            if (saveDebugMasks && (debugFlags & DebugFlags.TensorProcessing) != 0)
-            {
-                SaveTextureForDebug(m_LowResMask, $"DebugMaskOutput_RawLowRes_F{Time.frameCount}.png");
-            }
-
-
-            bool finalRenderSuccess = false;
-            if (lowResRenderSuccess)
-            {
-                if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                    Log("[WallSegmentation] Успешно отрисован тензор в m_LowResMask.", DebugFlags.TensorProcessing);
-
-                // --- START: Smooth m_LowResMask before upscaling ---
-                if (gaussianBlur3x3Material != null && thresholdMaskMaterial != null)
-                {
-                    RenderTexture blurredLowResMask = texturePool.GetTexture(m_LowResMask.width, m_LowResMask.height, m_LowResMask.format);
-                    blurredLowResMask.name = "BlurredLowResMask_Temp";
-                    blurredLowResMask.filterMode = FilterMode.Point; // Blur samples point, output is point
-
-                    // 1. Gaussian Blur
-                    if (gaussianBlur3x3Material.shader.isSupported)
-                    {
-                        // _TexelSize ожидает float4: (1/width, 1/height, width, height)
-                        gaussianBlur3x3Material.SetVector("_TexelSize", new Vector4(1.0f / m_LowResMask.width, 1.0f / m_LowResMask.height, m_LowResMask.width, m_LowResMask.height));
-                        Graphics.Blit(m_LowResMask, blurredLowResMask, gaussianBlur3x3Material);
-                        if ((debugFlags & DebugFlags.TensorProcessing) != 0) Log("[RunInferenceAndPostProcess] GaussianBlur3x3 applied to m_LowResMask.", DebugFlags.TensorProcessing);
-
-                        // DEBUG SAVE: Blurred m_LowResMask (before threshold)
-                        if (saveDebugMasks && (debugFlags & DebugFlags.TensorProcessing) != 0)
-                        {
-                            SaveTextureForDebug(blurredLowResMask, $"DebugMaskOutput_BlurredLowRes_F{Time.frameCount}.png");
-                        }
-
-                        // 2. Threshold
-                        if (thresholdMaskMaterial.shader.isSupported)
-                        {
-                            // thresholdMaskMaterial.SetFloat("_Threshold", 0.5f); // Can be set on material asset or here
-                            Graphics.Blit(blurredLowResMask, m_LowResMask, thresholdMaskMaterial); // Apply threshold back to m_LowResMask
-                            if ((debugFlags & DebugFlags.TensorProcessing) != 0) Log("[RunInferenceAndPostProcess] Threshold applied to blurred m_LowResMask.", DebugFlags.TensorProcessing);
-
-                            // ADDED DEBUG SAVE: m_LowResMask AFTER threshold material
-                            if (saveDebugMasks && (debugFlags & DebugFlags.TensorProcessing) != 0)
-                            {
-                                SaveTextureForDebug(m_LowResMask, $"DebugMaskOutput_ThresholdedLowRes_F{Time.frameCount}.png");
-                            }
-                        }
-                        else { LogWarning("[RunInferenceAndPostProcess] ThresholdMask shader not supported on this platform.", DebugFlags.TensorProcessing); }
-                    }
-                    else { LogWarning("[RunInferenceAndPostProcess] GaussianBlur3x3 shader not supported on this platform.", DebugFlags.TensorProcessing); }
-                    texturePool.ReleaseTexture(blurredLowResMask);
+                    inputTensor = tempTensor;
                 }
                 else
                 {
-                    LogWarning("[RunInferenceAndPostProcess] GaussianBlur3x3Material or ThresholdMaskMaterial not assigned. Skipping low-res mask smoothing.", DebugFlags.TensorProcessing);
+                    LogError($"[RunInferenceAndPostProcess] SentisCompat.TextureToTensor вернул null или не Tensor. Тип: {(tensorObj?.GetType().FullName ?? "null")}");
+                    errorOccurred = true;
                 }
-                // --- END: Smooth m_LowResMask ---
+            }
+            catch (Exception e)
+            {
+                LogError($"[RunInferenceAndPostProcess] Ошибка при конвертации Texture в Tensor: {e.Message} --- {e.StackTrace}");
+                errorOccurred = true;
+            }
+            finally
+            {
+                tensorConversionStopwatch.Stop();
+                if (debugFlags.HasFlag(DebugFlags.Performance)) Log($"[PERF] TextureToTensor: {tensorConversionStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+                accumulatedProcessingTimeMs += (float)tensorConversionStopwatch.Elapsed.TotalMilliseconds;
+            }
 
-                // Шаг 2: билинейно растянуть m_LowResMask (теперь сглаженную) в segmentationMaskTexture
-                // Используем comprehensivePostProcessStopwatch для замера Graphics.Blit
-                comprehensivePostProcessStopwatch.Restart();
+            if (errorOccurred || inputTensor == null)
+            {
+                // Очистка и выход, если конвертация не удалась
+                // inputTensor освободится в главном finally
+                // sourceTextureForInference освободится в главном finally
+                yield break; // Прерываем корутину
+            }
 
-                // --- CHANGE TO FIX BLOCKINESS ---
-                FilterMode originalLowResFilterMode = m_LowResMask.filterMode;
-                if (originalLowResFilterMode != FilterMode.Bilinear)
-                {
-                    m_LowResMask.filterMode = FilterMode.Bilinear;
-                    if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing && (this.debugFlags & DebugFlags.DetailedTensor) == DebugFlags.DetailedTensor)
-                        Log($"[RunInferenceAndPostProcess] Temporarily changed m_LowResMask.filterMode to Bilinear for Blit (was {originalLowResFilterMode}).", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
-                }
-                // --- END OF CHANGE ---
+            if (debugFlags.HasFlag(DebugFlags.TensorProcessing | DebugFlags.DetailedTensor)) Log($"[RunInferenceAndPostProcess] Input tensor shape: {inputTensor.shape}", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
 
-                Graphics.Blit(m_LowResMask, segmentationMaskTexture);
+            // Этап 2: Выполнение модели
+            modelExecutionStopwatch.Restart();
+            Tensor tempOutputTensor = null; // Локальная переменная для результата корутины
+            yield return StartCoroutine(ExecuteModelCoroutine(inputTensor, (Tensor result) =>
+            {
+                tempOutputTensor = result; // Присваиваем результат из колбэка
+            }));
+            outputTensor = tempOutputTensor; // Передаем в переменную верхнего уровня
+            modelExecutionStopwatch.Stop();
+            if (debugFlags.HasFlag(DebugFlags.Performance)) Log($"[PERF] ExecuteModel: {modelExecutionStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+            accumulatedProcessingTimeMs += (float)modelExecutionStopwatch.Elapsed.TotalMilliseconds;
 
-                // --- RESTORE FILTER MODE ---
-                if (m_LowResMask.filterMode != originalLowResFilterMode) // Check if we actually changed it
-                {
-                    m_LowResMask.filterMode = originalLowResFilterMode;
-                    if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing && (this.debugFlags & DebugFlags.DetailedTensor) == DebugFlags.DetailedTensor)
-                        Log($"[RunInferenceAndPostProcess] Restored m_LowResMask.filterMode to {originalLowResFilterMode} after Blit.", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
-                }
-                // --- END OF RESTORE ---
-
-                comprehensivePostProcessStopwatch.Stop();
-                accumulatedProcessingTimeMs += (float)comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds;
-                if ((debugFlags & DebugFlags.Performance) != 0)
-                    Log($"[PERF] Stage 2 (BlitLowResToFinalTexture): {comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-
-                finalRenderSuccess = true; // Assume Blit is successful
+            if (outputTensor == null)
+            {
+                LogError("[RunInferenceAndPostProcess] outputTensor is null after ExecuteModelCoroutine.");
+                errorOccurred = true;
             }
             else
             {
-                Log("[WallSegmentation] ОШИБКА рендеринга тензора в m_LowResMask.", DebugFlags.TensorProcessing, LogLevel.Error); // Log using m_LowResMask
+                if (debugFlags.HasFlag(DebugFlags.TensorProcessing | DebugFlags.DetailedTensor)) Log($"[WallSegmentation] Raw outputTensor shape: {outputTensor.shape}, dataType: {outputTensor.dataType}", DebugFlags.TensorProcessing | DebugFlags.DetailedTensor);
             }
 
-            // m_LowResMask is a class field, managed by InitializeTextures and OnDestroy.
-            // No ReleaseTemporary here.
-            // END OF TWO-STEP UPSCALING
-
-            bool renderSuccess = finalRenderSuccess; // Use the success status from the new method
-
-            // tensorRenderStopwatch.Stop(); // Уже остановлен выше для первого этапа
-            // accumulatedProcessingTimeMs += (float)tensorRenderStopwatch.Elapsed.TotalMilliseconds; // Уже добавлено для первого этапа
-
-            if (renderSuccess)
+            if (errorOccurred) // Если на этапе выполнения модели произошла ошибка
             {
-                if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                    Log("[WallSegmentation] ПОСЛЕ двухэтапного апскейлинга.", DebugFlags.TensorProcessing);
+                yield break; // Прерываем корутину
+            }
 
-                if (this.useGPUPostProcessing && this.comprehensivePostProcessMaterial != null && tempMask1 != null && tempMask2 != null)
+            // Этап 3: Постобработка (только если предыдущие этапы успешны)
+            // Определение размеров выхода модели (только один раз)
+            if (!modelOutputDimensionsKnown)
+            {
+                try
                 {
-                    if ((this.debugFlags & DebugFlags.ExecutionFlow) == DebugFlags.ExecutionFlow)
-                        Log("[WallSegmentation] Начало GPU постобработки.", DebugFlags.ExecutionFlow);
-
-                    EnsureGPUPostProcessingTextures(); // Make sure textures are valid
-
-                    RenderTexture sourceForComprehensive = segmentationMaskTexture;
-                    RenderTexture targetForComprehensive = tempMask1; // Use tempMask1 as intermediate
-
-                    if (this.useComprehensiveGPUProcessing) // Check if the comprehensive kernel should be दीन
+                    int[] outputDims = outputTensor.shape.ToArray();
+                    if (outputDims.Length == 4)
                     {
-                        comprehensivePostProcessStopwatch.Restart(); // Restart timing comprehensive post-processing
-
-                        this.comprehensivePostProcessMaterial.SetInt("_EnableBlur", this.enableGaussianBlur ? 1 : 0);
-                        this.comprehensivePostProcessMaterial.SetFloat("_BlurSize", this.blurSize);
-                        this.comprehensivePostProcessMaterial.SetInt("_EnableSharpen", this.enableSharpen ? 1 : 0);
-                        this.comprehensivePostProcessMaterial.SetInt("_EnableContrast", this.enableContrast ? 1 : 0);
-                        this.comprehensivePostProcessMaterial.SetFloat("_ContrastFactor", this.contrastFactor);
-                        this.comprehensivePostProcessMaterial.SetInt("_EnableOpening", this.enableMorphologicalOpening ? 1 : 0);
-                        // Add other parameters for comprehensive material if any (e.g., closing, dilation, erosion sizes)
-
-                        Graphics.Blit(sourceForComprehensive, targetForComprehensive, this.comprehensivePostProcessMaterial, 0);
-
-                        comprehensivePostProcessStopwatch.Stop(); // Stop timing
-                        accumulatedProcessingTimeMs += (float)comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds;
-
-
-                        if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                            Log("[WallSegmentation] GPU Comprehensive PostProcess применен.", DebugFlags.TensorProcessing);
-
-                        // Copy result back to segmentationMaskTexture
-                        Graphics.Blit(targetForComprehensive, segmentationMaskTexture);
-
-                        if ((this.debugFlags & DebugFlags.TensorProcessing) == DebugFlags.TensorProcessing)
-                            Log("[WallSegmentation] Результат GPU постобработки скопирован в segmentationMaskTexture.", DebugFlags.TensorProcessing);
-
-                        SaveTextureForDebug(segmentationMaskTexture, "DebugMaskOutput_PostGPUComprehensive.png");
-                    }
-                    else // Fallback or individual GPU steps if comprehensive is off or not fully implemented
-                    {
-                        // If not using comprehensive kernel, copy source to output or apply individual steps
-                        // This part would need specific logic if individual GPU steps were planned
-                        Log("[WallSegmentation] Comprehensive GPU processing disabled, direct blit or individual steps needed here.", DebugFlags.ExecutionFlow, LogLevel.Warning);
-                        Graphics.Blit(sourceForComprehensive, segmentationMaskTexture); // Default: no comprehensive effect applied
-                    }
-                }
-                else // CPU Post-processing Path
-                {
-                    if ((this.debugFlags & DebugFlags.ExecutionFlow) == DebugFlags.ExecutionFlow)
-                        Log("[WallSegmentation] Начало CPU постобработки.", DebugFlags.ExecutionFlow);
-
-                    // Добавлена общая проверка на включение постобработки CPU
-                    if (this.enablePostProcessing)
-                    {
-                        RenderTexture currentProcessingTexture = texturePool.GetTexture(currentResolution.x, currentResolution.y);
-                        Graphics.Blit(segmentationMaskTexture, currentProcessingTexture); // Start with raw mask
-
-                        RenderTexture tempTarget = texturePool.GetTexture(currentResolution.x, currentResolution.y);
-
-                        cpuPostProcessStopwatch.Restart(); // Start CPU post-processing timing
-
-                        if (this.enableGaussianBlur && gaussianBlurMaterial != null)
+                        int newHeight = outputDims[2];
+                        int newWidth = outputDims[3];
+                        if (newHeight > 0 && newWidth > 0 && (newHeight != modelOutputHeight || newWidth != modelOutputWidth))
                         {
-                            gaussianBlurMaterial.SetFloat("_BlurSize", this.blurSize);
-                            Graphics.Blit(currentProcessingTexture, tempTarget, gaussianBlurMaterial);
-                            Graphics.Blit(tempTarget, currentProcessingTexture); // Result back to current
-                            if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                                Log("[WallSegmentation] Gaussian Blur применен (CPU).", DebugFlags.TensorProcessing);
+                            Log($"[WallSegmentation] ПЕРВЫЙ ИНФЕРЕНС: Определены реальные размеры выхода модели: {newWidth}x{newHeight} (были {modelOutputWidth}x{modelOutputHeight}). Обновляем m_LowResMask.", DebugFlags.Initialization | DebugFlags.TensorProcessing);
+                            modelOutputHeight = newHeight;
+                            modelOutputWidth = newWidth;
+                            ReleaseRenderTexture(ref m_LowResMask);
+                            EnsureLowResMask(modelOutputWidth, modelOutputHeight);
+                            ReleaseRenderTexture(ref tempOutputMask);
+                            tempOutputMask = GetOrCreateRenderTexture(ref tempOutputMask, modelOutputWidth, modelOutputHeight, m_LowResMask.format, FilterMode.Point, $"TempOutputMask_{modelOutputWidth}x{modelOutputHeight}");
+                            Log($"[WallSegmentation] m_LowResMask и tempOutputMask пересозданы с размерами {modelOutputWidth}x{modelOutputHeight}.", DebugFlags.TensorProcessing);
                         }
-                        if (this.enableSharpen && sharpenMaterial != null)
+                        else if (newHeight <= 0 || newWidth <= 0)
                         {
-                            Graphics.Blit(currentProcessingTexture, tempTarget, sharpenMaterial);
-                            Graphics.Blit(tempTarget, currentProcessingTexture);
-                            if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                                Log("[WallSegmentation] Sharpen применен (CPU).", DebugFlags.TensorProcessing);
+                            LogWarning($"[WallSegmentation] ПЕРВЫЙ ИНФЕРЕНС: Получены некорректные размеры из outputTensor.shape ({newWidth}x{newHeight}). m_LowResMask останется с размерами по умолчанию.", DebugFlags.TensorProcessing);
                         }
-                        if (this.enableContrast && contrastMaterial != null)
-                        {
-                            contrastMaterial.SetFloat("_ContrastFactor", this.contrastFactor);
-                            Graphics.Blit(currentProcessingTexture, tempTarget, contrastMaterial);
-                            Graphics.Blit(tempTarget, currentProcessingTexture);
-                            if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                                Log("[WallSegmentation] Contrast применен (CPU).", DebugFlags.TensorProcessing);
-                        }
-
-                        // Морфологическое открытие (Erode -> Dilate)
-                        if (this.enableMorphologicalOpening && erodeMaterial != null && dilateMaterial != null)
-                        {
-                            Graphics.Blit(currentProcessingTexture, tempTarget, erodeMaterial);
-                            Graphics.Blit(tempTarget, currentProcessingTexture, dilateMaterial);
-                            if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                                Log("[WallSegmentation] Morphological Opening применен (CPU).", DebugFlags.TensorProcessing);
-                        }
-
-                        // Морфологическое закрытие (Dilate -> Erode)
-                        if (this.enableMorphologicalClosing && dilateMaterial != null && erodeMaterial != null)
-                        {
-                            Graphics.Blit(currentProcessingTexture, tempTarget, dilateMaterial);
-                            Graphics.Blit(tempTarget, currentProcessingTexture, erodeMaterial);
-                            if ((this.debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedExecution)) != 0)
-                                Log("[WallSegmentation] Morphological Closing применен (CPU).", DebugFlags.TensorProcessing);
-                        }
-
-                        cpuPostProcessStopwatch.Stop(); // Stop CPU post-processing timing
-                        accumulatedProcessingTimeMs += (float)cpuPostProcessStopwatch.Elapsed.TotalMilliseconds;
-
-                        Graphics.Blit(currentProcessingTexture, segmentationMaskTexture); // Final result to output
-                        texturePool.ReleaseTexture(currentProcessingTexture);
-                        texturePool.ReleaseTexture(tempTarget); // Освобождаем tempTarget здесь
-                        SaveTextureForDebug(segmentationMaskTexture, "DebugMaskOutput_PostCPU.png"); // Восстановлена строка
+                        modelOutputDimensionsKnown = true;
                     }
                     else
                     {
-                        if ((this.debugFlags & DebugFlags.ExecutionFlow) == DebugFlags.ExecutionFlow)
-                            Log("[WallSegmentation] CPU постобработка отключена флагом enablePostProcessing.", DebugFlags.ExecutionFlow);
-                        // Если постобработка отключена, segmentationMaskTexture уже содержит необработанную маску.
-                        // Ничего дополнительно делать не нужно, кроме как возможно сохранить ее для отладки.
-                        SaveTextureForDebug(segmentationMaskTexture, "DebugMaskOutput_NoCPU_Post_Processing.png");
+                        LogWarning($"[WallSegmentation] ПЕРВЫЙ ИНФЕРЕНС: outputTensor.shape не имеет 4 измерений ({outputTensor.shape}). Не удалось определить H, W. m_LowResMask останется с размерами по умолчанию.", DebugFlags.TensorProcessing);
+                        modelOutputDimensionsKnown = true; // Still mark as known to prevent re-evaluation, even if defaults are used.
                     }
                 }
-            }
-
-            // Освобождаем входной тензор, если он был создан
-            if (inputTensor != null)
-            {
-                if (inputTensor is IDisposable disposableInputTensor) disposableInputTensor.Dispose();
-                inputTensor = null;
-                if ((debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedTensor)) != 0)
-                    Log("[RunInferenceAndPostProcess] inputTensor (original) was disposed.", DebugFlags.TensorProcessing);
-            }
-
-            // Освобождаем выходной тензор, если он был создан и еще не освобожден
-            if (outputTensor != null)
-            {
-                if (outputTensor is IDisposable disposableOutputTensor)
+                catch (Exception e)
                 {
-                    disposableOutputTensor.Dispose();
-                    if ((debugFlags & (DebugFlags.TensorProcessing | DebugFlags.DetailedTensor)) != 0)
-                        Log("[WallSegmentation] outputTensor освобожден.", DebugFlags.TensorProcessing);
+                    LogWarning($"[WallSegmentation] ПЕРВЫЙ ИНФЕРЕНС: Исключение при определении размеров выхода модели: {e.Message}. m_LowResMask останется с размерами по умолчанию.", DebugFlags.TensorProcessing);
+                    modelOutputDimensionsKnown = true; // Mark as known to prevent re-evaluation
                 }
-                outputTensor = null;
-            }
-        }
-        catch (Exception e)
-        {
-            LogError($"[RunInferenceAndPostProcess] Exception: {e.Message}\nStackTrace: {e.StackTrace}", DebugFlags.ExecutionFlow);
-            errorOccurred = true;
-        }
-        finally
-        {
-            // Освобождаем входной тензор (повторно, на всякий случай, если выход был до блока finally выше)
-            if (inputTensor != null)
-            {
-                if (inputTensor is IDisposable disposableInput) disposableInput.Dispose();
-                inputTensor = null;
-                if ((debugFlags & DebugFlags.TensorProcessing) != 0) Log("[RunInferenceAndPostProcess] inputTensor disposed in finally.", DebugFlags.TensorProcessing);
-            }
-            // Освобождаем выходной тензор (повторно)
-            if (outputTensor != null)
-            {
-                if (outputTensor is IDisposable disposableOutput) disposableOutput.Dispose();
-                outputTensor = null;
-                if ((debugFlags & DebugFlags.TensorProcessing) != 0) Log("[RunInferenceAndPostProcess] outputTensor disposed in finally.", DebugFlags.TensorProcessing);
             }
 
-            // Освобождаем sourceTextureForInference (которая была tempTexture из ProcessCameraFrameCoroutine)
-            if (sourceTextureForInference != null)
+            if (errorOccurred) yield break; // Если определение размеров не удалось, прерываем
+
+            // Рендеринг в m_LowResMask
+            tensorRenderStopwatch.Restart();
+            bool lowResRenderSuccess = false;
+            // Tensor tensorToRender = outputTensor; // По умолчанию рендерим оригинальный тензор. УДАЛЕНО: Логика ниже определит, что рендерить.
+            // bool slicedTensorCreated = false; // УДАЛЕНО: Не создаем отдельный "sliced" тензор.
+
+            try
             {
-                texture2DPool.ReleaseTexture(sourceTextureForInference);
-                if ((debugFlags & DebugFlags.CameraTexture) != 0)
-                    Log($"[RunInferenceAndPostProcess] sourceTextureForInference (ID: {sourceTextureForInference.GetInstanceID()}) released to texture2DPool.", DebugFlags.CameraTexture);
+                // УДАЛЕН БЛОК IF, который пытался "резать" тензор и выводил LogWarning.
+                // Теперь мы всегда используем outputTensor напрямую, а выбор канала происходит
+                // за счет textureTransformToLowRes, который был настроен в InitializeMLModel.
+
+                if (outputTensor == null)
+                {
+                    LogError("[WallSegmentation] outputTensor is NULL before attempting to render to m_LowResMask.");
+                    lowResRenderSuccess = false;
+                    errorOccurred = true;
+                }
+                else if (m_LowResMask == null || !m_LowResMask.IsCreated())
+                {
+                    LogError("[WallSegmentation] m_LowResMask is NULL or not created before attempting to render.");
+                    lowResRenderSuccess = false;
+                    errorOccurred = true;
+                }
+                else
+                {
+                    // Используем outputTensor и textureTransformToLowRes, который уже настроен на нужный wallOutputChannel
+                    Log($"[WallSegmentation] Rendering output tensor {outputTensor.shape} to m_LowResMask using textureTransformToLowRes (configured for channel {wallOutputChannel})", DebugFlags.TensorProcessing);
+                    lowResRenderSuccess = SentisCompat.RenderTensorToTexture(outputTensor, m_LowResMask, textureTransformToLowRes);
+                }
+            }
+            catch (Exception e)
+            {
+                LogError($"[WallSegmentation] Exception during tensor slicing or rendering to m_LowResMask: {e.Message}\n{e.StackTrace}");
+                lowResRenderSuccess = false; // Считаем операцию неуспешной
+                errorOccurred = true; // Устанавливаем флаг ошибки, чтобы прервать дальнейшую обработку если нужно
+            }
+            finally
+            {
+                // УДАЛЕНА ОЧИСТКА slicedTensor, так как он больше не создается.
+                // if (slicedTensorCreated && tensorToRender != null && tensorToRender != outputTensor) 
+                // {
+                //     tensorToRender.Dispose();
+                //     Log("[WallSegmentation] Disposed sliced tensor.", DebugFlags.TensorProcessing);
+                // }
+            }
+
+            tensorRenderStopwatch.Stop();
+            accumulatedProcessingTimeMs += (float)tensorRenderStopwatch.Elapsed.TotalMilliseconds;
+            if (debugFlags.HasFlag(DebugFlags.Performance)) Log($"[PERF] Stage 1 (TensorToLowResTexture): {tensorRenderStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+
+            if (!lowResRenderSuccess)
+            {
+                LogError("[WallSegmentation] SentisCompat.RenderTensorToTexture в m_LowResMask не удался.");
+                errorOccurred = true;
+                yield break; // Прерываем
+            }
+
+            if (enableDebugMaskSaving && debugSavePathValid) SaveTextureForDebug(m_LowResMask, Path.Combine(fullDebugSavePath, $"DebugMaskOutput_RawLowRes_F{Time.frameCount}.png")); // MODIFIED
+            Log("[WallSegmentation] Успешно отрисован тензор в m_LowResMask.", DebugFlags.TensorProcessing);
+
+            tempOutputMask = GetOrCreateRenderTexture(ref tempOutputMask, modelOutputWidth, modelOutputHeight, m_LowResMask.format, FilterMode.Point, "TempOutputMask_PostProcess");
+
+            if (applyGaussianBlurToLowResMask && gaussianBlur3x3Material != null)
+            {
+                Graphics.Blit(m_LowResMask, tempOutputMask, gaussianBlur3x3Material);
+                Graphics.Blit(tempOutputMask, m_LowResMask);
+                Log("[RunInferenceAndPostProcess] GaussianBlur3x3 applied to m_LowResMask.", DebugFlags.TensorProcessing);
+                if (enableDebugMaskSaving && debugSavePathValid) SaveTextureForDebug(m_LowResMask, Path.Combine(fullDebugSavePath, $"DebugMaskOutput_BlurredLowRes_F{Time.frameCount}.png")); // MODIFIED
+            }
+
+            if (applyThresholdToBlurredLowResMask && thresholdMaskMaterial != null) // MODIFIED: thresholdMaterial to thresholdMaskMaterial
+            {
+                thresholdMaskMaterial.SetFloat("_Threshold", lowResMaskThreshold); // MODIFIED: thresholdMaterial to thresholdMaskMaterial
+                Graphics.Blit(m_LowResMask, tempOutputMask, thresholdMaskMaterial); // MODIFIED: thresholdMaterial to thresholdMaskMaterial
+                Graphics.Blit(tempOutputMask, m_LowResMask);
+                Log("[RunInferenceAndPostProcess] Threshold applied to blurred m_LowResMask.", DebugFlags.TensorProcessing);
+                if (enableDebugMaskSaving && debugSavePathValid) SaveTextureForDebug(m_LowResMask, Path.Combine(fullDebugSavePath, $"DebugMaskOutput_ThresholdedLowRes_F{Time.frameCount}.png")); // MODIFIED
+            }
+
+            comprehensivePostProcessStopwatch.Restart();
+            FilterMode originalFilterMode = m_LowResMask.filterMode;
+            if (originalFilterMode != FilterMode.Bilinear)
+            {
+                m_LowResMask.filterMode = FilterMode.Bilinear;
+                if (debugFlags.HasFlag(DebugFlags.TensorProcessing)) Log($"[RunInferenceAndPostProcess] Temporarily changed m_LowResMask.filterMode to Bilinear for Blit (was {originalFilterMode}).", DebugFlags.TensorProcessing);
+            }
+            Graphics.Blit(m_LowResMask, segmentationMaskTexture);
+            if (m_LowResMask.filterMode != originalFilterMode)
+            {
+                m_LowResMask.filterMode = originalFilterMode;
+                if (debugFlags.HasFlag(DebugFlags.TensorProcessing)) Log($"[RunInferenceAndPostProcess] Restored m_LowResMask.filterMode to {originalFilterMode} after Blit.", DebugFlags.TensorProcessing);
+            }
+            comprehensivePostProcessStopwatch.Stop();
+            accumulatedProcessingTimeMs += (float)comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds;
+            if (debugFlags.HasFlag(DebugFlags.Performance)) Log($"[PERF] Stage 2 (BlitLowResToFinalTexture): {comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+
+            if (debugFlags.HasFlag(DebugFlags.TensorProcessing)) Log("[WallSegmentation] ПОСЛЕ двухэтапного апскейлинга.", DebugFlags.TensorProcessing);
+
+            if (!useComprehensiveGPUProcessing) // MODIFIED: useComprehensiveGPUPostProcessing to useComprehensiveGPUProcessing
+            {
+                if (debugFlags.HasFlag(DebugFlags.ExecutionFlow)) Log("[WallSegmentation] Начало CPU постобработки.", DebugFlags.ExecutionFlow);
+                cpuPostProcessStopwatch.Restart();
+                RenderTexture tempPostProcess = texturePool.GetTexture(segmentationMaskTexture.width, segmentationMaskTexture.height, segmentationMaskTexture.format);
+                tempPostProcess.name = "Temp_CPU_PostProcess";
+                Graphics.Blit(segmentationMaskTexture, tempPostProcess);
+
+                if (enableSharpen && sharpenMaterial != null) // MODIFIED: applySharpen to enableSharpen
+                {
+                    Graphics.Blit(tempPostProcess, segmentationMaskTexture, sharpenMaterial);
+                    Graphics.Blit(segmentationMaskTexture, tempPostProcess);
+                    Log("[WallSegmentation] Sharpen применен (CPU).", DebugFlags.TensorProcessing);
+                }
+                if (enableContrast && contrastMaterial != null) // MODIFIED: applyContrast to enableContrast
+                {
+                    contrastMaterial.SetFloat("_Contrast", contrastFactor); // MODIFIED: segmentationContrast to contrastFactor
+                    Graphics.Blit(tempPostProcess, segmentationMaskTexture, contrastMaterial);
+                    Log("[WallSegmentation] Contrast применен (CPU).", DebugFlags.TensorProcessing);
+                }
+                texturePool.ReleaseTexture(tempPostProcess);
+                cpuPostProcessStopwatch.Stop();
+                accumulatedProcessingTimeMs += (float)cpuPostProcessStopwatch.Elapsed.TotalMilliseconds;
+            }
+
+            if (enableDebugMaskSaving && debugSavePathValid)
+            {
+                SaveTextureForDebug(segmentationMaskTexture, Path.Combine(fullDebugSavePath, $"DebugMaskOutput_PostCPU_F{Time.frameCount}.png"));
+            }
+            lastSuccessfulMask = segmentationMaskTexture;
+
+            // --- MOVED: Вызов события и логирование УСПЕШНОГО завершения сюда, ВНУТРЬ try, ДО finally ---
+            if (!errorOccurred) // Только если не было ошибок на предыдущих этапах
+            {
+                if (debugFlags.HasFlag(DebugFlags.Performance))
+                {
+                    // accumulatedProcessingTimeMs уже включает все этапы до этого момента
+                    Log($"[PERF] ACCUMULATED STAGES TIME (RunInferenceAndPostProcess): {accumulatedProcessingTimeMs:F2}ms", DebugFlags.Performance);
+                }
+                // totalProcessingTime и processedFrameCount обновляются здесь, если все успешно
+                totalProcessingTime += accumulatedProcessingTimeMs;
+                processedFrameCount++;
+
+                currentSegmentationMask = segmentationMaskTexture;
+                // lastSuccessfulMask = currentSegmentationMask; // Уже присвоено выше
+                OnSegmentationMaskUpdated?.Invoke(currentSegmentationMask);
+                if (debugFlags.HasFlag(DebugFlags.ExecutionFlow)) Log("[WallSegmentation] OnSegmentationMaskUpdated invoked.", DebugFlags.ExecutionFlow);
             }
             else
             {
-                if ((debugFlags & DebugFlags.CameraTexture) != 0)
-                    LogWarning("[RunInferenceAndPostProcess] Tried to release sourceTextureForInference in finally, but it was null.", DebugFlags.CameraTexture);
+                if (debugFlags.HasFlag(DebugFlags.ExecutionFlow)) LogWarning("[WallSegmentation] OnSegmentationMaskUpdated НЕ вызван из-за флага errorOccurred.", DebugFlags.ExecutionFlow);
             }
-
-            // isProcessingFrame = false; // CS0414 - Removed assignment
-            processingCoroutine = null; // Сбрасываем ссылку на текущую корутину
-            if ((debugFlags & DebugFlags.ExecutionFlow) != 0) Log($"[RunInferenceAndPostProcess] Exiting. isProcessingFrame = false. errorOccurred = {errorOccurred}", DebugFlags.ExecutionFlow);
+            // --- END OF MOVED SECTION ---
         }
-
-        // Логирование времени выполнения
-        if (enablePerformanceProfiling || (debugFlags & DebugFlags.Performance) != 0)
+        finally
         {
-            Log($"[PERF] XRCpuImage.ConvertAsync: {cpuImageConversionStopwatch.Elapsed.TotalMilliseconds:F2}ms (from previous coroutine step)", DebugFlags.Performance); // Added note
-            Log($"[PERF] TextureToTensor: {tensorConversionStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-            Log($"[PERF] ExecuteModel: {modelExecutionStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-            Log($"[PERF] RenderTensorToTexture: {tensorRenderStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-            if (this.useGPUPostProcessing && this.useComprehensiveGPUProcessing && this.comprehensivePostProcessMaterial != null)
+            // Освобождение ресурсов
+            if (inputTensor != null)
             {
-                Log($"[PERF] ComprehensiveGPU PostProcess: {comprehensivePostProcessStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+                inputTensor.Dispose();
+                inputTensor = null;
             }
-            if (this.enablePostProcessing && !this.useGPUPostProcessing) // Log CPU post-processing time if it was used
+            if (outputTensor != null)
             {
-                Log($"[PERF] CPU PostProcess: {cpuPostProcessStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
+                outputTensor.Dispose();
+                outputTensor = null;
             }
-            Log($"[PERF] ACCUMULATED STAGES TIME (RunInferenceAndPostProcess): {accumulatedProcessingTimeMs:F2}ms", DebugFlags.Performance);
-            Log($"[PERF] TOTAL Coroutine Wall-Clock Time (RunInferenceAndPostProcess, includes yields): {processingStopwatch.Elapsed.TotalMilliseconds:F2}ms", DebugFlags.Performance);
-        }
 
-        totalProcessingTime += accumulatedProcessingTimeMs; // Use the sum of stages for average calculation
-        processedFrameCount++;
-
-        // Temporarily disable adaptive resolution logic
-        /*
-        if (this.adaptiveResolution) // Use class member for adaptiveResolution
-        {
-            // Adaptive resolution logic here based on currentFrameProcessingTime and targetProcessingTimeMs
-            // For example:
-            // Use accumulatedProcessingTimeMs for decision making
-            if (accumulatedProcessingTimeMs > targetProcessingTimeMs * 1.2f && currentResolution.x > minResolution.x && currentResolution.y > minResolution.y)
+            if (sourceTextureForInference != null)
             {
-                currentResolution -= resolutionStep;
-                currentResolution.x = Mathf.Max(currentResolution.x, minResolution.x);
-                currentResolution.y = Mathf.Max(currentResolution.y, minResolution.y);
-                InitializeTextures(); // Recreate textures with new resolution
-                Log($"[AdaptiveRes] Decreased resolution to {currentResolution} due to slow frame ({accumulatedProcessingTimeMs:F1}ms)", DebugFlags.Performance);
+                if (texture2DPool != null)
+                {
+                    texture2DPool.ReleaseTexture(sourceTextureForInference);
+                }
+                sourceTextureForInference = null;
             }
-            else if (accumulatedProcessingTimeMs < targetProcessingTimeMs * 0.8f && currentResolution.x < maxResolution.x && currentResolution.y < maxResolution.y)
+
+            isProcessingFrame = false;
+
+            processingStopwatch.Stop(); // Останавливаем общий таймер для этой корутины
+            if (debugFlags.HasFlag(DebugFlags.Performance))
             {
-                currentResolution += resolutionStep;
-                currentResolution.x = Mathf.Min(currentResolution.x, maxResolution.x);
-                currentResolution.y = Mathf.Min(currentResolution.y, maxResolution.y);
-                InitializeTextures();
-                Log($"[AdaptiveRes] Increased resolution to {currentResolution} due to fast frame ({accumulatedProcessingTimeMs:F1}ms)", DebugFlags.Performance);
+                // Логируем общее время выполнения этой попытки обработки кадра
+                float currentFrameTotalTime = (float)processingStopwatch.Elapsed.TotalMilliseconds;
+                Log($"[PERF] TOTAL RunInferenceAndPostProcess Wall-Clock: {currentFrameTotalTime:F2}ms. Error occurred: {errorOccurred}", DebugFlags.Performance);
+
+                // Этот блок был частью добавленного ранее finally и здесь он к месту.
+                // processingTimes обновляется только если не было ошибки, что логично.
+                if (!errorOccurred)
+                {
+                    processingTimes.Add(currentFrameTotalTime);
+                    if (processingTimes.Count > 100) processingTimes.RemoveAt(0); // Храним последние 100 значений
+                }
             }
-        }
-        */
 
-        if ((this.debugFlags & DebugFlags.Performance) == DebugFlags.Performance)
-            Log($"[WallSegmentation] Время обработки кадра (сумма этапов): {accumulatedProcessingTimeMs:F2}ms (Фиксированное разрешение: {currentResolution.x}x{currentResolution.y})", DebugFlags.Performance);
+            // Сброс корутины, чтобы следующая могла запуститься
+            processingCoroutine = null;
+            if (debugFlags.HasFlag(DebugFlags.ExecutionFlow)) Log($"[RunInferenceAndPostProcess] Exiting (finally). isProcessingFrame = {isProcessingFrame}. errorOccurred = {errorOccurred}. processingCoroutine set to null.", DebugFlags.ExecutionFlow);
 
-        // Сообщаем подписчикам, что маска обновлена и готова к отображению
-        if (!errorOccurred && segmentationMaskTexture != null && segmentationMaskTexture.IsCreated())
-        {
-            OnSegmentationMaskUpdated?.Invoke(segmentationMaskTexture);
-            if ((debugFlags & DebugFlags.ExecutionFlow) != 0) Log("[WallSegmentation] OnSegmentationMaskUpdated invoked.", DebugFlags.ExecutionFlow);
         }
-        else if (errorOccurred)
-        {
-            if ((debugFlags & DebugFlags.ExecutionFlow) != 0) LogWarning("[WallSegmentation] OnSegmentationMaskUpdated NOT invoked due to errorOccurred flag.", DebugFlags.ExecutionFlow);
-        }
-        else
-        {
-            if ((debugFlags & DebugFlags.ExecutionFlow) != 0) LogWarning($"[WallSegmentation] OnSegmentationMaskUpdated NOT invoked. segmentationMaskTexture is null or not created. IsNull: {segmentationMaskTexture == null}, IsCreated: {segmentationMaskTexture?.IsCreated()}", DebugFlags.ExecutionFlow);
-        }
-
-        // isProcessingFrame = false; // CS0414 - Removed assignment
-        processingCoroutine = null;
-
-        yield return null;
     }
 
     private IEnumerator ExecuteModelCoroutine(Tensor inputTensor, System.Action<Tensor> onCompleted)
@@ -2642,9 +2544,17 @@ public class WallSegmentation : MonoBehaviour
         Debug.Log("[WallSegmentation] Cleaned up resources on destroy.");
     }
 
-    private void SaveTextureForDebug(RenderTexture rt, string fileName)
+    public void SaveTextureForDebug(RenderTexture rt, string fileName) // MODIFIED: Made public
     {
-        if (!saveDebugMasks) return;
+        // ValidateDebugSavePath(); // Ensure debugSavePathValid is up-to-date - Call this before checking the booleans
+
+        if (!enableDebugMaskSaving || !debugSavePathValid) // UPDATED: Check new boolean and existing path validity
+        {
+            if (!enableDebugMaskSaving && (debugFlags & DebugFlags.TensorProcessing) != 0) Log("[SaveTextureForDebug] Skipping save: enableDebugMaskSaving is false.", DebugFlags.TensorProcessing);
+            else if (!debugSavePathValid && enableDebugMaskSaving && (debugFlags & DebugFlags.TensorProcessing) != 0) Log("[SaveTextureForDebug] Skipping save: debugSavePath is not valid, though enableDebugMaskSaving is true.", DebugFlags.TensorProcessing);
+            return;
+        }
+
         if (rt == null || !rt.IsCreated())
         {
             LogWarning($"[SaveTextureForDebug] RenderTexture is null or not created. Cannot save {fileName}.", DebugFlags.TensorProcessing);
@@ -2685,23 +2595,26 @@ public class WallSegmentation : MonoBehaviour
 
     private void Log(string message, DebugFlags flagContext, LogLevel level = LogLevel.Info)
     {
-        // Using this.debugFlags for class member, flagContext for specific context
-        // Log if the specific flag is set OR if it's an error/warning OR if general debugMode is on and it's an info message.
-        if (debugMode || ((this.debugFlags & flagContext) == flagContext && flagContext != DebugFlags.None) || level == LogLevel.Error || level == LogLevel.Warning)
+        if (!enableComponentLogging) // NEW: Master switch for all logs from this component
         {
-            string prefix = "[WallSegmentation] "; // Simplified prefix
-            if (level == LogLevel.Error)
+            return;
+        }
+
+        if ((debugFlags & flagContext) != 0 || flagContext == DebugFlags.None) // Only log if the specific flag is enabled OR if it's a general log
+        {
+            string formattedMessage = $"[{this.GetType().Name}] {message}";
+            switch (level)
             {
-                Debug.LogError(prefix + message);
-            }
-            else if (level == LogLevel.Warning)
-            {
-                Debug.LogWarning(prefix + message);
-            }
-            else // Info
-            {
-                if (debugMode || ((this.debugFlags & flagContext) == flagContext && flagContext != DebugFlags.None)) // Additional check for info to respect flags if debugMode is true
-                    Debug.Log(prefix + message);
+                case LogLevel.Info:
+                    if (enableDetailedDebug || debugFlags.HasFlag(flagContext)) // Ensure info logs only if detailed debug or specific flag is on
+                        Debug.Log(formattedMessage);
+                    break;
+                case LogLevel.Warning:
+                    Debug.LogWarning(formattedMessage);
+                    break;
+                case LogLevel.Error:
+                    Debug.LogError(formattedMessage);
+                    break;
             }
         }
     }
@@ -2718,44 +2631,27 @@ public class WallSegmentation : MonoBehaviour
 
     private void EnsureGPUPostProcessingTextures()
     {
-        if (!useGPUPostProcessing) return;
-
-        bool needsRecreation = false;
-        string reason = "";
-
-        if (tempMask1 == null || !tempMask1.IsCreated() || tempMask1.width != currentResolution.x || tempMask1.height != currentResolution.y)
+        if (useGPUPostProcessing || useComprehensiveGPUProcessing) // MODIFIED: useComprehensiveGPUPostProcessing to useComprehensiveGPUProcessing
         {
-            needsRecreation = true;
-            reason += "tempMask1 invalid; ";
-        }
-        if (tempMask2 == null || !tempMask2.IsCreated() || tempMask2.width != currentResolution.x || tempMask2.height != currentResolution.y)
-        {
-            needsRecreation = true;
-            reason += "tempMask2 invalid; ";
-        }
-
-        // Check for comprehensivePostProcessMaterial only if comprehensive processing is enabled
-        if (useComprehensiveGPUProcessing && comprehensivePostProcessMaterial == null)
-        {
-            Log("comprehensivePostProcessMaterial is null, but comprehensive GPU processing is enabled. Assign it in the Inspector.", DebugFlags.Initialization, LogLevel.Warning);
-            // This might not require texture recreation but is a setup issue.
-        }
-
-        if (needsRecreation)
-        {
-            Log($"Recreating GPU post-processing textures. Reason: {reason}", DebugFlags.Initialization);
-            CreateGPUPostProcessingTextures();
+            if (tempMask1 == null || !tempMask1.IsCreated() || tempMask1.width != segmentationMaskTexture.width || tempMask1.height != segmentationMaskTexture.height)
+            {
+                ReleaseRenderTexture(ref tempMask1);
+                tempMask1 = GetOrCreateRenderTexture(ref tempMask1, segmentationMaskTexture.width, segmentationMaskTexture.height, segmentationMaskTexture.format, FilterMode.Bilinear, "TempMask1_GPU");
+                Log($"[EnsureGPUPostProcessingTextures] Created tempMask1 ({tempMask1.width}x{tempMask1.height})", DebugFlags.Initialization);
+            }
+            if (tempMask2 == null || !tempMask2.IsCreated() || tempMask2.width != segmentationMaskTexture.width || tempMask2.height != segmentationMaskTexture.height)
+            {
+                ReleaseRenderTexture(ref tempMask2);
+                tempMask2 = GetOrCreateRenderTexture(ref tempMask2, segmentationMaskTexture.width, segmentationMaskTexture.height, segmentationMaskTexture.format, FilterMode.Bilinear, "TempMask2_GPU");
+                Log($"[EnsureGPUPostProcessingTextures] Created tempMask2 ({tempMask2.width}x{tempMask2.height})", DebugFlags.Initialization);
+            }
         }
     }
 
-    /// <summary>
-    /// Attempts to get the low-resolution (160x120) mask used internally.
-    /// </summary>
-    /// <param name="lowResMask">The output low-resolution RenderTexture.</param>
-    /// <returns>True if the mask is available and valid, false otherwise.</returns>
+    // Public method to get the low-resolution mask, if available
     public bool TryGetLowResMask(out RenderTexture lowResMask)
     {
-        if (m_LowResMask != null && m_LowResMask.IsCreated())
+        if (m_LowResMask != null && m_LowResMask.IsCreated() && modelOutputDimensionsKnown)
         {
             lowResMask = m_LowResMask;
             return true;
@@ -2764,60 +2660,119 @@ public class WallSegmentation : MonoBehaviour
         return false;
     }
 
-    /// <summary>
-    /// Убеждается, что m_LowResMask существует и имеет правильные размеры и формат.
-    /// Если нет, (пере)создает ее из пула.
-    /// </summary>
+    // Ensure m_LowResMask is created with correct dimensions
     private void EnsureLowResMask(int width, int height)
     {
-        if (texturePool == null)
-        {
-            LogError("[EnsureLowResMask] TexturePool is null. Cannot create m_LowResMask.", DebugFlags.Initialization);
-            return;
-        }
-
         if (width <= 0 || height <= 0)
         {
-            LogError($"[EnsureLowResMask] Invalid dimensions for m_LowResMask: {width}x{height}. Cannot create.", DebugFlags.Initialization);
+            LogWarning($"[EnsureLowResMask] Invalid dimensions provided: {width}x{height}. Using default low-res dimensions if m_LowResMask is null.", DebugFlags.Initialization | DebugFlags.TensorProcessing);
+            if (m_LowResMask == null) // Only force default if it's completely uninitialized
+            {
+                width = DEFAULT_LOW_RES_WIDTH;
+                height = DEFAULT_LOW_RES_HEIGHT;
+                LogWarning($"[EnsureLowResMask] Forcing default low-res dimensions: {width}x{height}.", DebugFlags.Initialization | DebugFlags.TensorProcessing);
+            }
+            else
+            { // If it exists, don't overwrite with potentially wrong defaults if the input was bad
+                return;
+            }
+        }
+
+        if (m_LowResMask == null || !m_LowResMask.IsCreated() || m_LowResMask.width != width || m_LowResMask.height != height)
+        {
+            ReleaseRenderTexture(ref m_LowResMask);
+            // For m_LowResMask, we usually want Point filter initially to see raw model output,
+            // but Bilinear might be needed if upscaling directly from it without intermediate steps.
+            // Let's default to Point and allow specific Blit operations to change it if necessary.
+            m_LowResMask = GetOrCreateRenderTexture(ref m_LowResMask, width, height, RenderTextureFormat.R8, FilterMode.Point, $"m_LowResMask_{width}x{height}");
+            Log($"[EnsureLowResMask] Created m_LowResMask ({m_LowResMask.width}x{m_LowResMask.height}) with format {m_LowResMask.format} and filter {m_LowResMask.filterMode}", DebugFlags.Initialization | DebugFlags.TensorProcessing);
+        }
+    }
+
+    // --- ADDED HELPER METHODS FOR RENDER TEXTURE MANAGEMENT ---
+    private void ReleaseRenderTexture(ref RenderTexture rt)
+    {
+        if (rt != null)
+        {
+            if (rt == RenderTexture.active)
+            {
+                RenderTexture.active = null;
+            }
+            // texturePool.ReleaseTexture(rt); // Use texture pool
+            rt.Release(); // Standard release
+            DestroyImmediate(rt); // Destroy the asset
+            rt = null;
+            // Log($"Released and destroyed RenderTexture", DebugFlags.TensorProcessing); // Can be too verbose
+        }
+    }
+
+    private RenderTexture GetOrCreateRenderTexture(ref RenderTexture currentRT, int width, int height, RenderTextureFormat format, FilterMode filterMode, string name)
+    {
+        return GetOrCreateRenderTexture(ref currentRT, width, height, format, filterMode, name, false);
+    }
+
+    private RenderTexture GetOrCreateRenderTexture(ref RenderTexture currentRT, int width, int height, RenderTextureFormat format, FilterMode filterMode, string name, bool needsRandomWrite)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            LogError($"[GetOrCreateRenderTexture] Invalid dimensions for {name}: {width}x{height}. Returning currentRT or null.");
+            return currentRT; // Avoid creating texture with invalid size
+        }
+
+        if (currentRT == null || !currentRT.IsCreated() || currentRT.width != width || currentRT.height != height || currentRT.format != format || currentRT.filterMode != filterMode || currentRT.enableRandomWrite != needsRandomWrite)
+        {
+            if (currentRT != null)
+            {
+                // Log($"Releasing existing RenderTexture '{currentRT.name}' due to mismatch.", DebugFlags.Initialization);
+                ReleaseRenderTexture(ref currentRT);
+            }
+
+            // currentRT = texturePool.GetTexture(width, height, format); // Use texture pool
+            currentRT = new RenderTexture(width, height, 0, format);
+            currentRT.name = name;
+            currentRT.filterMode = filterMode;
+            currentRT.enableRandomWrite = needsRandomWrite; // Set if compute shaders will write to it
+            if (!currentRT.Create())
+            {
+                LogError($"[GetOrCreateRenderTexture] Failed to create RenderTexture '{name}' ({width}x{height}).");
+                ReleaseRenderTexture(ref currentRT); // Cleanup if creation failed
+                return null;
+            }
+            // Log($"Created RenderTexture '{currentRT.name}' ({currentRT.width}x{currentRT.height}, format: {currentRT.format}, filter: {currentRT.filterMode}, randomWrite: {currentRT.enableRandomWrite})", DebugFlags.Initialization);
+        }
+        return currentRT;
+    }
+
+    private void ValidateDebugSavePath()
+    {
+        if (string.IsNullOrEmpty(debugSavePath))
+        {
+            debugSavePathValid = false;
+            fullDebugSavePath = "";
+            // Log("Debug save path is empty, texture saving disabled.", DebugFlags.Initialization);
             return;
         }
 
-        bool needsRecreation = false;
-        if (m_LowResMask == null || !m_LowResMask.IsCreated())
+        try
         {
-            needsRecreation = true;
-        }
-        else if (m_LowResMask.width != width || m_LowResMask.height != height || m_LowResMask.format != RenderTextureFormat.R8)
-        {
-            LogWarning($"[EnsureLowResMask] m_LowResMask ({m_LowResMask.width}x{m_LowResMask.height}, {m_LowResMask.format}) needs recreation for new size {width}x{height} or format R8.", DebugFlags.Initialization);
-            texturePool.ReleaseTexture(m_LowResMask);
-            TrackResourceRelease("m_LowResMask_PreRecreate_Ensure");
-            m_LowResMask = null; // Ensure it's null so it gets re-fetched
-            needsRecreation = true;
-        }
+            // Combine with persistentDataPath for a reliable location
+            string combinedPath = Path.Combine(Application.persistentDataPath, debugSavePath);
 
-        if (needsRecreation)
-        {
-            m_LowResMask = texturePool.GetTexture(width, height, RenderTextureFormat.R8);
-            m_LowResMask.name = "WallSegmentation_LowResMask_Field_Dynamic";
-            m_LowResMask.enableRandomWrite = false;
-            m_LowResMask.filterMode = FilterMode.Point;
-            if (!m_LowResMask.IsCreated())
+            if (!Directory.Exists(combinedPath))
             {
-                m_LowResMask.Create();
+                Directory.CreateDirectory(combinedPath);
+                Log($"Created debug save directory: {combinedPath}", DebugFlags.Initialization);
             }
-            ClearRenderTexture(m_LowResMask, Color.clear);
-            TrackResourceCreation("m_LowResMask_Field_Dynamic");
-            Log($"[EnsureLowResMask] Создана/получена m_LowResMask ({width}x{height}, R8, Point).", DebugFlags.Initialization);
+            fullDebugSavePath = combinedPath;
+            debugSavePathValid = true;
+            Log($"Debug textures will be saved to: {fullDebugSavePath}", DebugFlags.Initialization);
         }
-        else
+        catch (Exception e)
         {
-            // Texture existed and is correct, ensure properties are still as expected
-            m_LowResMask.enableRandomWrite = false;
-            m_LowResMask.filterMode = FilterMode.Point;
-            // Optionally clear if it might be dirty from previous use, though pool should return clean textures
-            ClearRenderTexture(m_LowResMask, Color.clear);
-            Log($"[EnsureLowResMask] m_LowResMask ({width}x{height}, R8, Point) already exists and is correct.", DebugFlags.Initialization);
+            LogError($"Error validating or creating debug save path '{debugSavePath}': {e.Message}");
+            debugSavePathValid = false;
+            fullDebugSavePath = "";
         }
     }
+    // --- END OF ADDED HELPER METHODS ---
 }

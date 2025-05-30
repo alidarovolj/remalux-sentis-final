@@ -45,6 +45,10 @@ public class ARPlaneConfigurator : MonoBehaviour
     [Header("Отладка")]
     [SerializeField] private ARPlaneConfiguratorDebugFlags debugFlags = ARPlaneConfiguratorDebugFlags.None;
 
+    [Header("Global Logging Control")]
+    [Tooltip("Enable all logging messages from this ARPlaneConfigurator component. If false, no logs (Info, Warning, Error) will be printed from this script, regardless of individual DebugFlags.")]
+    public bool enableComponentLogging = true;
+
     // Список отслеживаемых вертикальных плоскостей для стабилизации
     private Dictionary<TrackableId, ARPlane> trackedVerticalPlanes = new Dictionary<TrackableId, ARPlane>();
     // Якоря для стабилизации вертикальных плоскостей
@@ -562,65 +566,93 @@ public class ARPlaneConfigurator : MonoBehaviour
 
     private void OnPlanesChanged(ARPlanesChangedEventArgs args)
     {
-        if (showDebugInfo)
+        if (!gameObject.activeInHierarchy || !enabled) return;
+
+        // Log details based on debug flags
+        if ((debugFlags & ARPlaneConfiguratorDebugFlags.PlaneLifecycle) != 0)
         {
-            LogPlaneChanges(args); // Логируем изменения
+            LogPlaneChanges(args);
         }
 
-        // Обработка добавленных плоскостей
+        // Process added planes
         foreach (var plane in args.added)
         {
-            if (plane == null || !plane.gameObject.activeInHierarchy) continue;
-            planeDetectionTimes[plane.trackableId] = Time.time;
+            if (plane == null) continue;
 
-            if (arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanes)
+            // Always add to detection times
+            if (!planeDetectionTimes.ContainsKey(plane.trackableId))
             {
-                ConfigurePlaneInternal(plane);
+                planeDetectionTimes.Add(plane.trackableId, Time.time);
+                if ((debugFlags & ARPlaneConfiguratorDebugFlags.PlaneLifecycle) != 0) Log($"Plane Added: {plane.trackableId}, DetectionTime Recorded: {Time.time}", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
             }
-            // else: если useDetectedPlanes = false, то ARManagerInitializer2 обрабатывает плоскости своей кастомной логикой,
-            // и ARPlaneConfigurator не должен вмешиваться в стандартные плоскости.
 
             if (IsVerticalPlane(plane))
             {
-                trackedVerticalPlanes[plane.trackableId] = plane;
-                if (improveVerticalPlaneStability && isInitialScanComplete && !planeAnchors.ContainsKey(plane.trackableId))
+                if (!trackedVerticalPlanes.ContainsKey(plane.trackableId))
                 {
-                    // CreateAnchorForPlane(plane);
+                    trackedVerticalPlanes.Add(plane.trackableId, plane);
+                    if ((debugFlags & ARPlaneConfiguratorDebugFlags.PlaneLifecycle) != 0) Log($"Vertical plane added to tracking: {plane.trackableId}", ARPlaneConfiguratorDebugFlags.PlaneLifecycle);
+                }
+
+                if (improveVerticalPlaneStability && anchorManager != null && !planeAnchors.ContainsKey(plane.trackableId))
+                {
+                    // CreateAnchorForPlane(plane); // Delay anchor creation or manage through stabilization
                 }
             }
-            // LogPlaneDetails(plane, "Обнаружена", стабильность: false);
+            ConfigurePlaneInternal(plane); // Apply initial material, etc.
+
+            // Apply segmentation mask if conditions are met
+            if (wallSegmentationInstance != null && wallSegmentationInstance.IsModelInitialized &&
+                arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanesForTap) // MODIFIED HERE
+            {
+                if (wallSegmentationInstance.TryGetLowResMask(out RenderTexture mask)) // Or use the main segmentationMaskTexture
+                {
+                    // ApplySegmentationMaskToPlane(plane, wallSegmentationInstance);
+                }
+            }
         }
 
-        // Обработка обновленных плоскостей
+        // Process updated planes
         foreach (var plane in args.updated)
         {
-            if (plane == null || !plane.gameObject.activeInHierarchy) continue;
+            if (plane == null) continue;
 
-            // Если плоскость уже помечена как постоянная и включено отключение обновлений
-            if (persistentPlaneIds.Contains(plane.trackableId) && disablePlaneUpdatesAfterStabilization && hasStabilizedPlanes)
+            if (!planeDetectionTimes.ContainsKey(plane.trackableId))
             {
-                if (showDebugInfo)
-                {
-                    Debug.Log($"ARPlaneConfigurator: Игнорируется обновление для постоянной плоскости: {plane.trackableId}");
-                }
-                continue;
+                planeDetectionTimes.Add(plane.trackableId, Time.time); // Should ideally exist, but good fallback
             }
-
-            if (arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanes)
-            {
-                UpdatePlaneInternal(plane);
-            }
-            // else: см. комментарий выше для ConfigurePlane
 
             if (IsVerticalPlane(plane))
             {
-                trackedVerticalPlanes[plane.trackableId] = plane;
-                // Обновляем информацию о плоскости (например, если она изменила размер или положение)
-                // LogPlaneDetails(plane, "Обновлена", стабильность: false);
+                if (trackedVerticalPlanes.ContainsKey(plane.trackableId))
+                {
+                    trackedVerticalPlanes[plane.trackableId] = plane; // Update reference
+                }
+                else
+                {
+                    trackedVerticalPlanes.Add(plane.trackableId, plane);
+                }
+            }
+            UpdatePlaneInternal(plane); // Re-apply material or other updates
+
+            // Potentially re-apply segmentation mask on update
+            if (wallSegmentationInstance != null && wallSegmentationInstance.IsModelInitialized &&
+                arManagerInitializerInstance != null && arManagerInitializerInstance.useDetectedPlanesForTap) // MODIFIED HERE
+            {
+                if (wallSegmentationInstance.TryGetLowResMask(out RenderTexture mask))
+                {
+                    // ApplySegmentationMaskToPlane(plane, wallSegmentationInstance);
+                }
+            }
+
+            // Check for stabilization and persistence
+            if (persistDetectedPlanes && isInitialScanComplete)
+            {
+                // ... existing code ...
             }
         }
 
-        // Обработка удаленных плоскостей
+        // Process removed planes
         foreach (var plane in args.removed) // args.removed is List<ARPlane>
         {
             if (plane == null) continue;
@@ -921,20 +953,51 @@ public class ARPlaneConfigurator : MonoBehaviour
     {
         if (plane == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.ConfigurePlane: plane is null");
+            LogWarning("ConfigurePlane: plane is null"); // Используем локальный Log
             return;
         }
 
-        // Добавим проверки на null для manager и wallSegmentation
+        // Присваиваем зависимости
+        this.arManagerInitializerInstance = manager;
+        this.wallSegmentationInstance = wallSegmentation;
+
         if (manager == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.ConfigurePlane: ARManagerInitializer2 (manager) is null. Plane configuration might be incomplete.");
-            // Решаем, как обрабатывать: можно либо выйти, либо продолжить с ограниченной конфигурацией.
-            // Для примера, продолжим, но некоторые функции могут не работать.
+            LogWarning("ConfigurePlane: ARManagerInitializer2 (manager) is null. Plane configuration might be incomplete.");
+            // Попытка найти ARPlaneManager через FindObjectOfType как крайняя мера, если manager не передан
+            if (this.planeManager == null)
+            {
+                this.planeManager = FindObjectOfType<ARPlaneManager>();
+                if (this.planeManager != null)
+                {
+                    Log("ConfigurePlane: ARPlaneManager found via FindObjectOfType as manager was null.");
+                }
+                else
+                {
+                    LogError("ConfigurePlane: ARPlaneManager could not be found (manager was null).");
+                }
+            }
         }
+        else
+        {
+            // Получаем ARPlaneManager из переданного arManagerInitializerInstance
+            if (this.planeManager == null) // Если еще не назначен
+            {
+                this.planeManager = manager.planeManager; // Предполагается, что у ARManagerInitializer2 есть публичное свойство planeManager
+                if (this.planeManager != null)
+                {
+                    Log("ConfigurePlane: ARPlaneManager assigned from ARManagerInitializer2.");
+                }
+                else
+                {
+                    LogError("ConfigurePlane: ARManagerInitializer2 was provided, but its planeManager is null.");
+                }
+            }
+        }
+
         if (wallSegmentation == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.ConfigurePlane: WallSegmentation (wallSegmentation) is null. Segmentation mask will not be applied.");
+            LogWarning("ConfigurePlane: WallSegmentation (wallSegmentation) is null. Segmentation mask will not be applied.");
         }
 
         // Get or add MeshRenderer component
@@ -1035,18 +1098,40 @@ public class ARPlaneConfigurator : MonoBehaviour
     {
         if (plane == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.UpdatePlane: plane is null");
+            LogWarning("UpdatePlane: plane is null"); // Используем локальный Log
             return;
         }
 
-        // Добавим проверки на null для manager и wallSegmentation
+        // Присваиваем/обновляем зависимости, если они еще не установлены или если это необходимо
+        if (this.arManagerInitializerInstance == null) this.arManagerInitializerInstance = manager;
+        if (this.wallSegmentationInstance == null) this.wallSegmentationInstance = wallSegmentation;
+
         if (manager == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.UpdatePlane: ARManagerInitializer2 (manager) is null. Plane update might be incomplete.");
+            LogWarning("UpdatePlane: ARManagerInitializer2 (manager) is null. Plane update might be incomplete.");
+            if (this.planeManager == null)
+            {
+                this.planeManager = FindObjectOfType<ARPlaneManager>();
+                if (this.planeManager != null) Log("UpdatePlane: ARPlaneManager found via FindObjectOfType as manager was null.");
+                else LogError("UpdatePlane: ARPlaneManager could not be found (manager was null).");
+            }
         }
+        else
+        {
+            if (this.planeManager == null && manager.planeManager != null)
+            {
+                this.planeManager = manager.planeManager;
+                Log("UpdatePlane: ARPlaneManager assigned from ARManagerInitializer2.");
+            }
+            else if (this.planeManager == null) // manager.planeManager is also null
+            {
+                LogError("UpdatePlane: ARManagerInitializer2 was provided, but its planeManager is null.");
+            }
+        }
+
         if (wallSegmentation == null)
         {
-            Debug.LogWarning("ARPlaneConfigurator.UpdatePlane: WallSegmentation (wallSegmentation) is null. Segmentation mask will not be applied during update.");
+            LogWarning("UpdatePlane: WallSegmentation (wallSegmentation) is null. Segmentation mask will not be applied during update.");
         }
 
         // Don't update persistent planes if they're marked as stable
@@ -1259,12 +1344,31 @@ public class ARPlaneConfigurator : MonoBehaviour
 
     private void Log(string message, ARPlaneConfiguratorDebugFlags flag = ARPlaneConfiguratorDebugFlags.None, ARManagerLogLevel level = ARManagerLogLevel.Info)
     {
-        if ((debugFlags & flag) == flag || flag == ARPlaneConfiguratorDebugFlags.All || flag == ARPlaneConfiguratorDebugFlags.None)
+        if (!enableComponentLogging && level != ARManagerLogLevel.Error && !(level == ARManagerLogLevel.Warning && this.debugFlags.HasFlag(ARPlaneConfiguratorDebugFlags.Initialization))) // Allow critical init warnings
+        {
+            return;
+        }
+
+        // if (this.debugFlags.HasFlag(flag) || flag == ARPlaneConfiguratorDebugFlags.None || level == ARManagerLogLevel.Error || (level == ARManagerLogLevel.Warning && this.debugFlags.HasFlag(ARPlaneConfiguratorDebugFlags.Initialization)))
+        // Более простое условие: логируем ошибки всегда (если компонентное логирование включено), предупреждения если включен флаг или нет флагов, инфо если включен флаг или нет флагов
+        bool shouldLog = false;
+        if (level == ARManagerLogLevel.Error && enableComponentLogging) shouldLog = true;
+        else if (level == ARManagerLogLevel.Warning && enableComponentLogging && (this.debugFlags.HasFlag(flag) || flag == ARPlaneConfiguratorDebugFlags.None || this.debugFlags.HasFlag(ARPlaneConfiguratorDebugFlags.Initialization))) shouldLog = true;
+        else if (level == ARManagerLogLevel.Info && enableComponentLogging && (this.debugFlags.HasFlag(flag) || flag == ARPlaneConfiguratorDebugFlags.None)) shouldLog = true;
+
+
+        if (shouldLog)
         {
             string prefix = "[ARPlaneConfigurator] ";
-            if (level == ARManagerLogLevel.Error) Debug.LogError(prefix + message);
-            else if (level == ARManagerLogLevel.Warning) Debug.LogWarning(prefix + message);
-            else Debug.Log(prefix + message);
+            string fullMessage = prefix + message;
+            if (flag != ARPlaneConfiguratorDebugFlags.None)
+            {
+                fullMessage = $"[ARPlaneConfigurator][{flag}] {message}";
+            }
+
+            if (level == ARManagerLogLevel.Error) Debug.LogError(fullMessage, gameObject); // Добавляем контекст gameObject
+            else if (level == ARManagerLogLevel.Warning) Debug.LogWarning(fullMessage, gameObject);
+            else Debug.Log(fullMessage, gameObject);
         }
     }
 

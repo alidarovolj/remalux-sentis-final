@@ -1,25 +1,32 @@
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
-using Unity.XR.CoreUtils;
-using System.Collections;
-using System.Collections.Generic;
-using System.Linq;
 using UnityEngine.XR.ARSubsystems;
+using System.Collections.Generic;
+using System.Linq; // Explicitly adding System.Linq
 using System;
-using UnityEngine.Rendering;
-using System.IO; // NEW: For file operations
+using System.Collections;
+using Random = UnityEngine.Random;
+using UnityEngine.Events;
+using TMPro; // If you are using TextMeshPro
+using System.IO; // For file operations
+using UnityEngine.Rendering; // For CommandBuffer
+using Unity.XR.CoreUtils; // Ensure Unity.XR.CoreUtils is present for XROrigin
+using UnityEngine.XR.Management;
+using UnityEngine.InputSystem; // Added for the new Input System
 
-// Basic DebugFlags and LogLevel for ARManagerInitializer2
+
+[System.Flags]
 public enum ARManagerDebugFlags
 {
     None = 0,
     Initialization = 1 << 0,
     PlaneGeneration = 1 << 1,
     Raycasting = 1 << 2,
-    ARSystem = 1 << 3, // For AR specific logs like light estimation
-    System = 1 << 4, // For general system events like subscribe/unsubscribe
-    Performance = 1 << 5,
-    SaveDebugTextures = 1 << 6, // ADDED: For controlling texture saving
+    DetailedRaycastLogging = 1 << 3,
+    ARSystem = 1 << 4,
+    System = 1 << 5,
+    Performance = 1 << 6,
+    SaveDebugTextures = 1 << 7,
     All = ~0
 }
 
@@ -35,6 +42,11 @@ public class ARManagerInitializer2 : MonoBehaviour
 {
     public static ARManagerInitializer2 Instance { get; private set; }
     private static int planeInstanceCounter = 0;
+    private string[] ignoredObjectNamesArray;
+
+    [Header("Отладка ARManagerInitializer2")]
+    [Tooltip("Флаги для детальной отладки различных частей ARManagerInitializer2.")]
+    public ARManagerDebugFlags debugFlags = ARManagerDebugFlags.None;
 
     [Header("AR компоненты")]
     [Tooltip("Reference to the XROrigin in the scene. If not set, will try to find one.")]
@@ -46,37 +58,59 @@ public class ARManagerInitializer2 : MonoBehaviour
     public ARAnchorManager arAnchorManager;
 
     [Tooltip("AR Mesh Manager для Scene Reconstruction (LiDAR сканирование)")]
-    public ARMeshManager arMeshManager;
-
+    [SerializeField] private ARMeshManager arMeshManager;
     [Tooltip("Включить Scene Reconstruction на устройствах с LiDAR")]
-    public bool enableSceneReconstruction = true;
+    [SerializeField] private bool enableSceneReconstruction = true;
 
     [Tooltip("Directional Light, который будет обновляться AR Light Estimation")]
-    [SerializeField] private Light arDirectionalLight;
+    [SerializeField] public Light mainLight; // Made public for external access if needed
 
     [Header("Настройки сегментации")]
-    public bool useDetectedPlanes = false;
-    [SerializeField] private float minPlaneSizeInMeters = 0.1f;
-    [SerializeField] private int minPixelsDimensionForLowResArea = 4;
-    [SerializeField] private int minAreaSizeInLowResPixels = 16;
-    [Range(0, 255)] public byte wallAreaRedChannelThreshold = 250; // Changed from 220 to 250
+    [Tooltip("Использовать ли выход сегментации для создания или фильтрации плоскостей AR.")]
+    public bool useSegmentationForPlaneGeneration = true;
+    [SerializeField] private int minPixelsDimensionForLowResArea = 10;
+    [SerializeField] private int minAreaSizeInLowResPixels = 20;
+    [Range(0, 255)] public byte wallMaskRedChannelMinThreshold = 250;
 
     [Header("Настройки Рейкастинга для Плоскостей")]
-    public bool enableDetailedRaycastLogging = true; // Default to true for easier debugging
-    public float maxRayDistance = 15.0f;
-    public LayerMask hitLayerMask = -1; // Initialized in Awake()
+    [Tooltip("Максимальное расстояние рейкаста для поиска поверхностей.")]
+    public float maxRayDistance = 10f;
+    [Tooltip("Порог для определения горизонтальной поверхности (dot product с Vector3.up). Больше = строже.")]
+    [Range(0.7f, 1.0f)] public float horizontalSurfaceThreshold = 0.95f;
+    [Tooltip("Разрешить создание плоскостей на не строго вертикальных поверхностях.")]
+    public bool allowNonVerticalWallPlanes = true;
+    [Tooltip("Максимальный угол (в градусах) между направлением камеры и нормалью плоскости для её создания.")]
+    [Range(0f, 90f)] public float maxCameraAngleToPlaneNormal = 75f;
+    [Tooltip("Порог расстояния для слияния новой плоскости с существующей.")]
+    public float planeMergeDistanceThreshold = 0.1f;
+    [Tooltip("Детальное логирование параметров рейкастинга.")]
+    public bool enableDetailedRaycastLogging = false; // Controlled by debugFlags as well
+
+    public LayerMask hitLayerMask = -1;
     public float minHitDistanceThreshold = 0.1f;
     public float maxWallNormalAngleDeviation = 30f;
     public float maxFloorCeilingAngleDeviation = 15f;
-    [Tooltip("Расстояние по умолчанию для создания плоскости, если рейкаст не нашел поверхности (в метрах)")]
-    public float defaultPlaneDistance = 2.5f;
-    [Tooltip("Имя слоя для создаваемых плоскостей (должен существовать в Tags and Layers)")]
-    [SerializeField] private string planeLayerName = "ARPlanes";
-    [Tooltip("Имена объектов, которые должны игнорироваться при рейкастинге (разделены запятыми)")]
-    [SerializeField] private string ignoreObjectNames = "Player,UI,Hand";
+    [Tooltip("Расстояние по умолчанию для создания плоскости, если рейкаст не нашел поверхности.")]
+    public float defaultPlaneDistance = 2.0f;
+    [Tooltip("Минимальное расстояние для создания плоскости.")]
+    public float minPlaneCreationDistance = 0.3f;
+    [Tooltip("Имя слоя для создаваемых плоскостей.")]
+    public string planeLayerName = "ARFoundationsPlanes"; // Ensure this layer exists
+    [Tooltip("Имена объектов, которые должны игнорироваться при рейкастинге (разделены запятыми).")]
+    public string ignoredObjectNames = "FPSController,XR Origin,Main Camera,AR Session,AR Input Manager";
+
+
+    [Header("Настройки создаваемых плоскостей")]
+    [Tooltip("Префаб для создаваемой плоскости (должен иметь ARPlaneConfigurator).")]
+    public GameObject arPaintPlanePrefab;
+    [Tooltip("Масштаб по умолчанию для создаваемых плоскостей.")]
+    public Vector3 defaultPlaneScale = Vector3.one;
+    [Tooltip("Ширина плоскости по умолчанию, создаваемой, если рейкаст не нашел поверхности.")]
+    public float defaultPlaneWidth = 1.0f;
+    [Tooltip("Высота плоскости по умолчанию, создаваемой, если рейкаст не нашел поверхности.")]
+    public float defaultPlaneHeight = 1.0f;
 
     [Header("Настройки сохранения плоскостей")]
-    [SerializeField] private bool usePersistentPlanes = true;
     [SerializeField] private bool highlightPersistentPlanes = false;
     [SerializeField] private Color persistentPlaneColor = new Color(0.0f, 0.8f, 0.2f, 0.7f);
     private Dictionary<GameObject, bool> persistentGeneratedPlanes = new Dictionary<GameObject, bool>();
@@ -84,12 +118,13 @@ public class ARManagerInitializer2 : MonoBehaviour
     private Dictionary<GameObject, float> planeLastVisitedTime = new Dictionary<GameObject, float>();
 
     [Tooltip("Материал для вертикальных плоскостей")]
-    [SerializeField] private Material verticalPlaneMaterial;
+    public Material verticalPlaneMaterial;
     [Tooltip("Материал для горизонтальных плоскостей")]
-    [SerializeField] private Material horizontalPlaneMaterial;
+    public Material horizontalPlaneMaterial;
+
 
     [Header("Отладочная Визуализация Лучей")]
-    [SerializeField] private Material debugRayMaterial;
+    public bool drawDebugRays = true;
     private MaterialPropertyBlock debugRayMaterialPropertyBlock;
 
     private UnityEngine.UI.RawImage отображениеМаскиUI;
@@ -97,493 +132,578 @@ public class ARManagerInitializer2 : MonoBehaviour
     private RenderTexture lowResSegmentationMask;
     private bool newMaskAvailableForProcessing = false;
     private List<GameObject> generatedPlanes = new List<GameObject>();
+    private List<GameObject> allGeneratedPlanes = new List<GameObject>(); // Keeps track of all planes, including ARFoundation's
+    private List<GameObject> activePlanesForPainting = new List<GameObject>(); // Planes specifically created/used by this script for painting
+
     private int frameCounter = 0;
     private float lastSuccessfulSegmentationTime = 0f;
     private int trackablesParentInstanceID_FromStart = 0;
-    private int lowResMaskSaveCounter = 0; // NEW: Counter for saved low-res masks
+    private int lowResMaskSaveCounter = 0;
 
     [Header("Настройки Кластеризации Рейкастов")]
-    public bool enableRaycastClustering = true;
-    public int clusteringMinHitsThreshold = 1;
+    [Tooltip("Использовать ли кластеризацию рейкастов для определения центра области.")]
+    public bool useRaycastClustering = false;
+    public int clusteringMinHitsThreshold = 3; // Minimum hits to consider a cluster valid
 
-    [SerializeField] private ARPlaneConfigurator planeConfigurator;
+    [SerializeField] private ARPlaneConfigurator planeConfigurator; // Should be on the arPaintPlanePrefab
     [SerializeField] private WallSegmentation wallSegmentation;
 
-    [Header("Отладка ARManagerInitializer2")]
-    public ARManagerDebugFlags debugFlags = ARManagerDebugFlags.None; // Default value for custom logs
+    [Header("Global Logging Control")]
+    [Tooltip("Enable all logging messages from this ARManagerInitializer2 component.")]
+    public bool enableComponentLogging = true;
 
     [Header("Настройки Выделения Плоскостей")]
-    [Tooltip("Материал для выделенной AR плоскости. Если не задан, будет изменен цвет текущего материала.")]
-    public Material selectedPlaneMaterial;
+    [Tooltip("Материал, используемый для выделения выбранной плоскости (опционально).")]
+    public Material selectionMaterial;
     [Tooltip("Материал, используемый для покраски стен. Должен иметь свойство _PaintColor и _SegmentationMask.")]
-    public Material paintMaterial;
+    public Material wallPaintMaterial;
     private ARPlane currentlySelectedPlane;
     private Material originalSelectedPlaneMaterial;
     private Dictionary<ARPlane, Material> paintedPlaneOriginalMaterials = new Dictionary<ARPlane, Material>();
 
     private ARWallPaintColorManager colorManager;
-    private bool isSubscribedToWallSegmentation = false; // Flag to track subscription
+    private bool isSubscribedToWallSegmentation = false;
 
-    // Custom Log methods (controlled by debugFlags)
+    [Header("Tap Interaction")]
+    [Tooltip("Использовать ли обнаруженные AR-плоскости для взаимодействия по тапу.")]
+    public bool useDetectedPlanesForTap = true;
+    [Tooltip("Всегда использовать Physics.Raycast для создаваемых плоскостей, даже если AR Raycast был успешен.")]
+    public bool alwaysUsePhysicsRaycastForCustomPlanes = false;
+    [Tooltip("Использовать ли Physics.Raycast для взаимодействия по тапу в дополнение к AR Raycast.")]
+    public bool usePhysicsRaycastForTap = true;
+    private TrackableType trackableTypesToHit = TrackableType.PlaneWithinPolygon | TrackableType.FeaturePoint;
+
+    [Header("Автоматическое создание геометрии сцены (для симуляции)")]
+    [Tooltip("Создавать ли базовую геометрию сцены для работы физического рейкастинга в редакторе.")]
+    public bool createBasicSceneGeometry = true;
+    [Tooltip("Размер создаваемой комнаты (X, Y, Z) в метрах.")]
+    public Vector3 basicSceneRoomSize = new Vector3(10, 3, 10);
+    [Tooltip("Толщина создаваемых стен для коллайдеров.")]
+    public float basicSceneWallThickness = 0.1f;
+    [Tooltip("Имя слоя для создаваемой базовой геометрии.")]
+    public string basicSceneGeometryLayerName = "SimulatedEnvironment"; // Ensure this layer exists
+
     private void Log(string message, ARManagerDebugFlags flag = ARManagerDebugFlags.None, ARManagerLogLevel level = ARManagerLogLevel.Info)
     {
-        if ((debugFlags & flag) == flag || flag == ARManagerDebugFlags.All || flag == ARManagerDebugFlags.None || debugFlags == ARManagerDebugFlags.All)
+        if (!enableComponentLogging)
         {
-            string prefix = $"[{this.GetType().Name}] ";
-            if (level == ARManagerLogLevel.Error) Debug.LogError(prefix + message);
-            else if (level == ARManagerLogLevel.Warning) Debug.LogWarning(prefix + message);
-            else Debug.Log(prefix + message);
+            if (level == ARManagerLogLevel.Error)
+            {
+                if (this.debugFlags == ARManagerDebugFlags.None) return;
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        bool isDirectLog = flag == ARManagerDebugFlags.None && level == ARManagerLogLevel.Info;
+        bool isError = level == ARManagerLogLevel.Error;
+        bool isWarning = level == ARManagerLogLevel.Warning;
+
+        if (this.debugFlags.HasFlag(flag) || isDirectLog || isError || isWarning)
+        {
+            string formattedMessage = $"[{GetType().Name}] {message}";
+            if (!isDirectLog && !isError && !isWarning)
+            {
+                formattedMessage = $"[{GetType().Name}] [{flag}] {message}";
+            }
+            else if (isDirectLog)
+            {
+                // formattedMessage = $"[{GetType().Name}] {message} (Direct Log)"; // Already default
+            }
+
+            switch (level)
+            {
+                case ARManagerLogLevel.Error:
+                    Debug.LogError(formattedMessage, this);
+                    break;
+                case ARManagerLogLevel.Warning:
+                    Debug.LogWarning(formattedMessage, this);
+                    break;
+                case ARManagerLogLevel.Info:
+                default:
+                    Debug.Log(formattedMessage, this);
+                    break;
+            }
         }
     }
+
     private void LogError(string message, ARManagerDebugFlags flag = ARManagerDebugFlags.None) => Log(message, flag, ARManagerLogLevel.Error);
     private void LogWarning(string message, ARManagerDebugFlags flag = ARManagerDebugFlags.None) => Log(message, flag, ARManagerLogLevel.Warning);
 
     private void Awake()
     {
-        Debug.Log($"[{this.GetType().Name}] AWAKE_METHOD_ENTERED_TOP (Direct Log)"); // Direct log
-        debugRayMaterial = null; // <--- FORCE NULL FOR TESTING MATERIAL CREATION
-        Debug.LogWarning($"[{this.GetType().Name}] Awake: DEBUG - Forcing debugRayMaterial to null to test default material creation. (Direct Log)");
-
+        Log($"[{GetType().Name}] AWAKE_METHOD_ENTERED_TOP (Direct Log - Before Singleton)", ARManagerDebugFlags.Initialization);
         if (Instance != null && Instance != this)
         {
-            Debug.LogWarning($"[{this.GetType().Name}] Duplicate instance of ARManagerInitializer2 detected. Destroying this one. (Direct Log)"); // Direct log
+            LogWarning("Multiple instances of ARManagerInitializer2 detected. Destroying this one.", ARManagerDebugFlags.Initialization);
             Destroy(gameObject);
             return;
         }
         Instance = this;
-        planeInstanceCounter = 0;
+        Log("Singleton instance set.", ARManagerDebugFlags.Initialization);
 
-        hitLayerMask = ~0; // TEMPORARY TEST: Raycast against all layers
-        Debug.LogWarning($"[{this.GetType().Name}] Awake: TEMPORARY TEST - hitLayerMask set to ALL LAYERS (~0). Value: {hitLayerMask.value} (Direct Log)");
+        if (string.IsNullOrEmpty(ignoredObjectNames))
+        {
+            ignoredObjectNamesArray = new string[0];
+        }
+        else
+        {
+            ignoredObjectNamesArray = ignoredObjectNames.Split(',').Select(s => s.Trim()).ToArray();
+            Log($"Ignored object names loaded: {string.Join(", ", ignoredObjectNamesArray)}", ARManagerDebugFlags.Initialization);
+        }
 
 
-        ARManagerDebugFlags initialDebugFlags = debugFlags; // Store inspector value
-        Debug.Log($"[{this.GetType().Name}] Awake: Initial debugFlags from Inspector = {initialDebugFlags} (Direct Log)"); // Direct log
-        debugFlags = initialDebugFlags; // Ensure we use the inspector value, not force All
+        // Initialize hitLayerMask to exclude "UI" and the planeLayerName
+        int uiLayer = LayerMask.NameToLayer("UI");
+        int arPlaneLayer = LayerMask.NameToLayer(planeLayerName);
+        int simulatedEnvLayer = LayerMask.NameToLayer(basicSceneGeometryLayerName);
+
+        LayerMask defaultMask = Physics.DefaultRaycastLayers;
+        if (uiLayer != -1) defaultMask &= ~(1 << uiLayer);
+        if (arPlaneLayer != -1) defaultMask &= ~(1 << arPlaneLayer);
+        // We WANT to hit the simulated environment, so we don't exclude it here.
+        // It will be part of the default physics raycast layers unless explicitly excluded.
+
+        hitLayerMask = defaultMask; // Start with default and then potentially add specific layers if needed.
+
+        Log($"Awake: Initial hitLayerMask before specific additions/exclusions based on default: {LayerMaskToString(hitLayerMask)} (Raw: {hitLayerMask.value})", ARManagerDebugFlags.Initialization);
+
+
+        // Ensure the simulated environment layer IS part of the hitLayerMask if it exists
+        if (simulatedEnvLayer != -1)
+        {
+            hitLayerMask |= (1 << simulatedEnvLayer);
+            Log($"Ensured '{basicSceneGeometryLayerName}' (Layer {simulatedEnvLayer}) is INCLUDED in hitLayerMask.", ARManagerDebugFlags.Initialization);
+        }
+        else
+        {
+            LogWarning($"Layer '{basicSceneGeometryLayerName}' not found. Physics raycasts might not hit simulated environment correctly.", ARManagerDebugFlags.Initialization);
+        }
+
+        // If planeLayerName is also for custom physics objects we want to hit for other reasons,
+        // this setup might need adjustment. For now, assuming planeLayerName is for AR planes we *don't* want physics raycast to hit for initial placement.
+        // However, for tap-painting, we might want to hit these custom planes. This is handled in HandlePlaneSelectionByTap.
+
+        Log($"Awake: Final hitLayerMask = {LayerMaskToString(hitLayerMask)} (Raw value: {hitLayerMask.value})", ARManagerDebugFlags.Initialization);
+
+        ARManagerDebugFlags initialDebugFlags = this.debugFlags; // Store inspector value
+        Log($"Awake: Initial debugFlags from Inspector = {initialDebugFlags}", ARManagerDebugFlags.Initialization);
+        this.debugFlags = initialDebugFlags; // Ensure we use the inspector value
 
         if (debugRayMaterialPropertyBlock == null)
         {
             debugRayMaterialPropertyBlock = new MaterialPropertyBlock();
-            Debug.Log($"[{this.GetType().Name}] Awake: Initialized debugRayMaterialPropertyBlock. (Direct Log)");
         }
-
-        if (enableDetailedRaycastLogging)
-        {
-            Debug.Log($"[{this.GetType().Name}] Awake: enableDetailedRaycastLogging is TRUE. (Direct Log)");
-        }
-
-        if (debugRayMaterial == null)
-        {
-            Shader unlitShader = Shader.Find("Unlit/Color");
-            if (unlitShader != null)
-            {
-                debugRayMaterial = new Material(unlitShader);
-                debugRayMaterial.color = Color.magenta; // Default color
-                Debug.LogWarning($"[{this.GetType().Name}] Awake: debugRayMaterial was null and has been initialized with a default Magenta Unlit/Color material. (Direct Log)");
-            }
-            else
-            {
-                Debug.LogError($"[{this.GetType().Name}] Awake: debugRayMaterial is null and Shader.Find(\"Unlit/Color\") failed. Debug rays will not be visible. (Direct Log)");
-            }
-        }
-
-
-        if (transform.parent == null)
-        {
-            Log("Making it DontDestroyOnLoad as it's a root object.", ARManagerDebugFlags.System);
-        }
-
 
         if (wallSegmentation == null)
         {
-            Debug.LogError($"[{this.GetType().Name}] Awake: WallSegmentation component is not assigned in the inspector! Custom plane generation will not work. (Direct Log)");
+            wallSegmentation = FindObjectOfType<WallSegmentation>();
+            if (wallSegmentation != null) Log("WallSegmentation found via FindObjectOfType in Awake.", ARManagerDebugFlags.Initialization);
+            else LogWarning("WallSegmentation not assigned and not found in scene via FindObjectOfType in Awake.", ARManagerDebugFlags.Initialization);
         }
 
-        FindARComponents();
-        Debug.Log($"[{this.GetType().Name}] AWAKE_METHOD_EXIT. wallSegmentation is {(wallSegmentation == null ? "NOT ASSIGNED" : "ASSIGNED")}. debugFlags: {debugFlags} (Direct Log)");
-    }
-
-    private void OnEnable()
-    {
-        Debug.Log($"[{this.GetType().Name}] OnEnable: Method Entered. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")}. Current debugFlags: {debugFlags} (Direct Log)"); // Direct log
-        SubscribeToWallSegmentation();
-        InitializeLightEstimation();
-        InitializeEnvironmentProbes();
-        InitializeSceneReconstruction();
-        if (arCameraManager != null) arCameraManager.frameReceived += OnARFrameReceived;
-        if (arMeshManager != null) arMeshManager.meshesChanged += OnMeshesChanged;
-        Debug.Log($"[{this.GetType().Name}] OnEnable: Subscriptions attempted. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct log
-    }
-
-    private void Start()
-    {
-        Debug.Log($"[{this.GetType().Name}] START_METHOD_ENTERED_TOP (Direct Log)"); // Direct log
-        Debug.Log($"[{this.GetType().Name}] Start: Initial debugFlags from Inspector = {debugFlags} (Direct Log)"); // Direct log
-
-        Debug.Log($"[{this.GetType().Name}] Start: Before FindARComponents. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct log
-        FindARComponents();
-        Debug.Log($"[{this.GetType().Name}] Start: After FindARComponents. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct log
-
-        InitializeMaterials();
-
-        Debug.Log($"[{this.GetType().Name}] Start: About to call SubscribeToWallSegmentation. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct log
-        SubscribeToWallSegmentation(); // Attempt subscription from Start
-
-        InitializeLightEstimation();
-        InitializeEnvironmentProbes();
-        InitializeSceneReconstruction();
-
-        int planeLayer = LayerMask.NameToLayer(planeLayerName);
-        if (planeLayer != -1)
+        if (arPaintPlanePrefab != null && planeConfigurator == null)
         {
-            Debug.Log($"[{this.GetType().Name}] Start: Layer '{planeLayerName}' (ID: {planeLayer}) is intended for generated planes. Ensure this layer is included in general raycasts if needed or use a specific mask for plane creation raycasts. (Direct Log)");
-        }
-        else
-        {
-            Debug.LogWarning($"[{this.GetType().Name}] Start: Layer '{planeLayerName}' for generated planes not found. Please define it in Tags and Layers. (Direct Log)");
-        }
-
-
-        if (wallSegmentation == null)
-        {
-            Debug.LogError($"[{this.GetType().Name}] Start: WallSegmentation is still NULL after Awake and FindARComponents in Start! (Direct Log)");
-        }
-
-        if (!useDetectedPlanes)
-        {
-            if (planeManager != null)
+            planeConfigurator = arPaintPlanePrefab.GetComponent<ARPlaneConfigurator>();
+            if (planeConfigurator == null)
             {
-                planeManager.enabled = false;
-                Debug.Log($"[{this.GetType().Name}] Start: ARPlaneManager disabled because useDetectedPlanes is false. (Direct Log)");
-            }
-            if (planeConfigurator != null)
-            {
-                planeConfigurator.enabled = false;
-                Debug.Log($"[{this.GetType().Name}] Start: ARPlaneConfigurator component disabled because useDetectedPlanes is false. (Direct Log)");
+                LogWarning($"ARPaintPlanePrefab '{arPaintPlanePrefab.name}' does not have an ARPlaneConfigurator component. Plane configuration might not work as expected.", ARManagerDebugFlags.Initialization);
             }
         }
+        else if (arPaintPlanePrefab == null)
+        {
+            LogWarning("ARPaintPlanePrefab is not assigned. Custom plane creation will not work.", ARManagerDebugFlags.Initialization);
+        }
+
 
         colorManager = FindObjectOfType<ARWallPaintColorManager>();
         if (colorManager == null)
         {
-            Debug.LogError($"[{this.GetType().Name}] Start: ARWallPaintColorManager не найден на сцене! (Direct Log)");
+            LogWarning("ARWallPaintColorManager not found in scene.", ARManagerDebugFlags.Initialization);
         }
-        Debug.Log($"[{this.GetType().Name}] Start() CОMPLETED. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")}. Raycast LayerMask (general): {LayerMaskToString(hitLayerMask)} (Direct Log)");
+
+        // FindARComponents is called in Start to ensure XROrigin and its children are fully initialized.
+        InitializePersistentPlanesSystem();
+
+        Log($"AWAKE_METHOD_EXIT. wallSegmentation is {(wallSegmentation != null ? "ASSIGNED" : "NOT ASSIGNED")}. debugFlags: {this.debugFlags}", ARManagerDebugFlags.Initialization);
     }
+
+    private void OnEnable()
+    {
+        Debug.Log($"[{this.GetType().Name}] OnEnable: Method Entered. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")}. Current debugFlags: {this.debugFlags} (Direct Log)"); // Direct log
+        SubscribeToWallSegmentation();
+        InitializeLightEstimation();
+        InitializeEnvironmentProbes();
+        InitializeSceneReconstruction(); // Initialize (or re-initialize) scene reconstruction
+        Log("OnEnable: Subscriptions and AR features initialization attempted.", ARManagerDebugFlags.System);
+    }
+
+    private void Start()
+    {
+        Debug.Log($"[{this.GetType().Name}] START_METHOD_ENTERED_TOP (Direct Log)"); // Direct Log
+        Debug.Log($"[{this.GetType().Name}] Start: Initial debugFlags from Inspector = {this.debugFlags} (Direct Log)"); // Direct Log
+
+        Debug.Log($"[{this.GetType().Name}] Start: Before FindARComponents. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct Log
+        FindARComponents(); // Ensure all AR components are found and assigned
+        Debug.Log($"[{this.GetType().Name}] Start: After FindARComponents. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")} (Direct Log)"); // Direct Log
+
+
+        if (planeManager != null)
+        {
+            planeManager.planesChanged += OnPlanesChanged;
+            Log("Subscribed to ARPlaneManager.planesChanged event.", ARManagerDebugFlags.System);
+            // Log existing planes
+            foreach (var plane in planeManager.trackables)
+            {
+                OnPlaneAdded(plane); // Process initially existing planes
+            }
+        }
+        else
+        {
+            LogError("ARPlaneManager is null in Start. Plane detection will not work.", ARManagerDebugFlags.Initialization);
+        }
+
+
+        InitializeMaterials();
+
+
+        if (createBasicSceneGeometry)
+        {
+            CreateBasicSceneGeometry();
+        }
+
+        if (xrOrigin != null && xrOrigin.TrackablesParent != null)
+        {
+            trackablesParentInstanceID_FromStart = xrOrigin.TrackablesParent.GetInstanceID();
+            Log($"Start: Stored TrackablesParent Instance ID: {trackablesParentInstanceID_FromStart} from XROrigin: {xrOrigin.TrackablesParent.name}", ARManagerDebugFlags.Initialization);
+        }
+        else if (planeManager != null && planeManager.trackables.count > 0) // Check count first
+        {
+            ARPlane firstPlane = null;
+            foreach (ARPlane plane in planeManager.trackables) // Iterate to get the first available plane
+            {
+                firstPlane = plane;
+                break; // Exit after finding the first one
+            }
+
+            if (firstPlane != null && firstPlane.transform.parent != null)
+            {
+                trackablesParentInstanceID_FromStart = firstPlane.transform.parent.GetInstanceID();
+                Log($"Start: Stored TrackablesParent Instance ID: {trackablesParentInstanceID_FromStart} from first ARPlane's parent: {firstPlane.transform.parent.name}", ARManagerDebugFlags.Initialization);
+            }
+            else
+            {
+                LogWarning("Start: Could not determine TrackablesParent Instance ID from existing planes.", ARManagerDebugFlags.Initialization);
+            }
+        }
+        else
+        {
+            LogWarning("Start: XROrigin.TrackablesParent is null and no AR planes found to determine TrackablesParent Instance ID.", ARManagerDebugFlags.Initialization);
+        }
+
+        Log($"START_METHOD_EXIT. wallSegmentation is {(wallSegmentation != null ? "ASSIGNED" : "NOT ASSIGNED")}", ARManagerDebugFlags.Initialization);
+    }
+
 
     private void Update()
     {
         frameCounter++;
+        HandlePlaneSelectionByTap(); // Check for taps to select/paint planes
 
-        if (newMaskAvailableForProcessing && !useDetectedPlanes)
+        if (highlightPersistentPlanes)
         {
-            Log("Update: Calling ProcessSegmentationMask() because newMaskAvailableForProcessing is true", ARManagerDebugFlags.PlaneGeneration);
-            if (lowResSegmentationMask != null && lowResSegmentationMask.IsCreated())
+            foreach (var entry in persistentGeneratedPlanes)
             {
-                ProcessSegmentationMask(lowResSegmentationMask);
+                if (entry.Key != null && entry.Value) // if is persistent
+                {
+                    Renderer rend = entry.Key.GetComponent<Renderer>();
+                    if (rend != null && rend.material.color != persistentPlaneColor)
+                    {
+                        rend.material.color = persistentPlaneColor;
+                    }
+                }
             }
-            else
-            {
-                LogWarning("Update: newMaskAvailableForProcessing is true, but lowResSegmentationMask is null or not created. Skipping ProcessSegmentationMask.", ARManagerDebugFlags.PlaneGeneration);
-            }
-            newMaskAvailableForProcessing = false;
-        }
-
-        if (frameCounter % 300 == 0)
-        {
-            CleanupOldPlanes(null);
-        }
-
-        HandlePlaneSelectionByTap();
-
-        if (!useDetectedPlanes && planeManager != null && planeManager.enabled)
-        {
-            LogWarning("ARPlaneManager was found enabled in Update, despite useDetectedPlanes = false. Forcibly disabling.", ARManagerDebugFlags.Initialization);
-            planeManager.enabled = false;
-        }
-        if (!useDetectedPlanes && planeConfigurator != null && planeConfigurator.enabled)
-        {
-            LogWarning("ARPlaneConfigurator was found enabled in Update, despite useDetectedPlanes = false. Forcibly disabling.", ARManagerDebugFlags.Initialization);
-            planeConfigurator.enabled = false;
         }
     }
 
     private void SubscribeToWallSegmentation()
     {
-        Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: Method Entered. wallSegmentation is {(wallSegmentation == null ? "NULL" : "ASSIGNED")}, isSubscribed: {isSubscribedToWallSegmentation} (Direct Log)");
-
-        if (wallSegmentation == null)
+        if (wallSegmentation != null && !isSubscribedToWallSegmentation)
         {
-            Debug.LogWarning($"[{this.GetType().Name}] SubscribeToWallSegmentation: wallSegmentation was null, trying FindObjectOfType. (Direct Log)");
-            wallSegmentation = FindObjectOfType<WallSegmentation>();
+            Log("Attempting to subscribe to WallSegmentation events.", ARManagerDebugFlags.System);
+            wallSegmentation.OnSegmentationMaskUpdated += OnSegmentationMaskUpdated;
+            // Assuming WallSegmentation has an event for when the low-resolution mask (before upscaling) is ready
+            if (wallSegmentation.TryGetLowResMask(out _)) // Check if method exists (conceptual)
+            {
+                // wallSegmentation.OnLowResMaskReady += OnLowResSegmentationMaskReady; // Hypothetical event
+            }
+            isSubscribedToWallSegmentation = true;
+            Log("Subscribed to WallSegmentation.OnSegmentationMaskUpdated.", ARManagerDebugFlags.System);
         }
-
-        if (wallSegmentation != null)
+        else if (wallSegmentation == null)
         {
-            if (!isSubscribedToWallSegmentation)
-            {
-                Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: Attempting to subscribe to WallSegmentation.OnSegmentationMaskUpdated. (Direct Log)");
-                wallSegmentation.OnSegmentationMaskUpdated += OnSegmentationMaskUpdated;
-                isSubscribedToWallSegmentation = true;
-                Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: Successfully subscribed. isSubscribedToWallSegmentation = {isSubscribedToWallSegmentation} (Direct Log)");
-
-                if (wallSegmentation.IsModelInitialized && wallSegmentation.segmentationMaskTexture != null && wallSegmentation.segmentationMaskTexture.IsCreated())
-                {
-                    Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: WallSegmentation model is initialized and has a mask. Requesting initial mask. (Direct Log)");
-                    OnSegmentationMaskUpdated(wallSegmentation.segmentationMaskTexture);
-                }
-                else
-                {
-                    Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: WallSegmentation model not yet initialized or mask not ready. Will wait for event. (Direct Log)");
-                }
-            }
-            else
-            {
-                Debug.Log($"[{this.GetType().Name}] SubscribeToWallSegmentation: Already subscribed to WallSegmentation.OnSegmentationMaskUpdated. (Direct Log)");
-            }
+            LogWarning("WallSegmentation component not found. Cannot subscribe to segmentation events.", ARManagerDebugFlags.System);
         }
-        else
+        else if (isSubscribedToWallSegmentation)
         {
-            Debug.LogError($"[{this.GetType().Name}] SubscribeToWallSegmentation: WallSegmentation instance is NULL. Cannot subscribe. (Direct Log)");
-            if (Application.isPlaying && gameObject.activeInHierarchy && enabled)
-            {
-                Debug.LogWarning($"[{this.GetType().Name}] SubscribeToWallSegmentation: Retrying subscription to WallSegmentation soon... (Direct Log)");
-                StartCoroutine(RetrySubscriptionAfterDelay(1.0f));
-            }
+            // Log("Already subscribed to WallSegmentation events.", ARManagerDebugFlags.System);
         }
     }
 
     private IEnumerator RetrySubscriptionAfterDelay(float delay)
     {
-        Debug.LogWarning($"[{this.GetType().Name}] RetrySubscriptionAfterDelay: Will retry WallSegmentation subscription in {delay} seconds. (Direct Log)");
         yield return new WaitForSeconds(delay);
-        Debug.LogWarning($"[{this.GetType().Name}] RetrySubscriptionAfterDelay: Retrying WallSegmentation subscription NOW. (Direct Log)");
+        Log("Retrying subscription to WallSegmentation after delay.", ARManagerDebugFlags.System);
         SubscribeToWallSegmentation();
     }
 
+
     private void OnDisable()
     {
-        Debug.Log($"[{this.GetType().Name}] OnDisable: Method Entered. (Direct Log)");
-        if (wallSegmentation != null && isSubscribedToWallSegmentation)
+        Log("OnDisable: Unsubscribing from events.", ARManagerDebugFlags.System);
+        if (planeManager != null)
         {
-            Debug.Log($"[{this.GetType().Name}] OnDisable: Unsubscribing from WallSegmentation.OnSegmentationMaskUpdated. (Direct Log)");
-            wallSegmentation.OnSegmentationMaskUpdated -= OnSegmentationMaskUpdated;
-            isSubscribedToWallSegmentation = false;
-        }
-        else if (wallSegmentation == null)
-        {
-            Debug.LogWarning($"[{this.GetType().Name}] OnDisable: wallSegmentation is null, cannot unsubscribe. (Direct Log)");
-        }
-        else if (!isSubscribedToWallSegmentation)
-        {
-            Debug.LogWarning($"[{this.GetType().Name}] OnDisable: Was not subscribed to wallSegmentation, no need to unsubscribe. (Direct Log)");
+            planeManager.planesChanged -= OnPlanesChanged;
+            Log("Unsubscribed from ARPlaneManager.planesChanged.", ARManagerDebugFlags.System);
         }
 
-        if (arCameraManager != null) arCameraManager.frameReceived -= OnARFrameReceived;
-        if (arMeshManager != null) arMeshManager.meshesChanged -= OnMeshesChanged;
-        Log("ARManagerInitializer2 OnDisable: Other event unsubscriptions completed.", ARManagerDebugFlags.System);
+        if (wallSegmentation != null && isSubscribedToWallSegmentation)
+        {
+            wallSegmentation.OnSegmentationMaskUpdated -= OnSegmentationMaskUpdated;
+            // if (wallSegmentation.TryGetLowResMask(out _)) // conceptual
+            // {
+            //    // wallSegmentation.OnLowResMaskReady -= OnLowResSegmentationMaskReady;
+            // }
+            isSubscribedToWallSegmentation = false;
+            Log("Unsubscribed from WallSegmentation.OnSegmentationMaskUpdated.", ARManagerDebugFlags.System);
+        }
+
+        if (arCameraManager != null)
+        {
+            arCameraManager.frameReceived -= OnARFrameReceived;
+            Log("Unsubscribed from ARCameraManager.frameReceived.", ARManagerDebugFlags.System);
+        }
+        if (arMeshManager != null && enableSceneReconstruction)
+        {
+            arMeshManager.meshesChanged -= OnMeshesChanged;
+            Log("Unsubscribed from ARMeshManager.meshesChanged.", ARManagerDebugFlags.System);
+        }
     }
 
     private void InitializeLightEstimation()
     {
-        if (arCameraManager != null && arDirectionalLight != null)
+        if (arCameraManager != null && mainLight != null)
         {
-            arCameraManager.frameReceived -= OnARFrameReceived;
+            arCameraManager.frameReceived -= OnARFrameReceived; // Ensure no double subscription
             arCameraManager.frameReceived += OnARFrameReceived;
-            Log("Subscribed to ARCameraManager.frameReceived for light estimation.", ARManagerDebugFlags.Initialization);
+            Log("Light estimation initialized and subscribed to ARCameraManager.frameReceived.", ARManagerDebugFlags.ARSystem);
         }
         else
         {
-            if (arCameraManager == null) LogWarning("ARCameraManager not found, cannot initialize light estimation.", ARManagerDebugFlags.Initialization);
-            if (arDirectionalLight == null) LogWarning("AR Directional Light not assigned, cannot initialize light estimation.", ARManagerDebugFlags.Initialization);
+            if (arCameraManager == null) LogWarning("ARCameraManager not found, cannot initialize light estimation.", ARManagerDebugFlags.Initialization | ARManagerDebugFlags.ARSystem);
+            if (mainLight == null) LogWarning("AR Directional Light (mainLight) not assigned, cannot initialize light estimation.", ARManagerDebugFlags.Initialization | ARManagerDebugFlags.ARSystem);
         }
     }
 
     private void InitializeEnvironmentProbes()
     {
-        LogWarning("Environment probe initialization currently disabled.", ARManagerDebugFlags.Initialization);
+        // Placeholder for environment probe logic if needed
+        // Example: if (arEnvironmentProbeManager != null) { ... }
+        Log("Environment Probes initialization placeholder.", ARManagerDebugFlags.ARSystem);
     }
-
     private void InitializeSceneReconstruction()
     {
-        if (!enableSceneReconstruction)
+        if (arMeshManager != null)
         {
-            Log("Scene Reconstruction is administratively disabled by 'enableSceneReconstruction' flag.", ARManagerDebugFlags.Initialization);
-            if (arMeshManager != null) arMeshManager.enabled = false;
-            return;
-        }
-
-        if (arMeshManager == null)
-        {
-            LogWarning("ARMeshManager component is not assigned. Scene Reconstruction cannot be enabled.", ARManagerDebugFlags.Initialization);
-            enableSceneReconstruction = false;
-            return;
-        }
-
-        if (arMeshManager.subsystem != null)
-        {
-            try
+            if (enableSceneReconstruction && arMeshManager.subsystem != null && arMeshManager.subsystem.running)
             {
-                arMeshManager.enabled = true;
-                if (arMeshManager.subsystem.running)
-                {
-                    Log($"✅ ARMeshManager enabled and subsystem is running. Scene Reconstruction active.", ARManagerDebugFlags.ARSystem);
-                }
-                else
-                {
-                    LogWarning($"ARMeshManager enabled, but subsystem is not running. Scene Reconstruction might not be fully active. Subsystem state: {arMeshManager.subsystem.running}", ARManagerDebugFlags.ARSystem);
-                }
+                arMeshManager.meshesChanged -= OnMeshesChanged; // Ensure no double subscription
+                arMeshManager.meshesChanged += OnMeshesChanged;
+                // arMeshManager.density = 0.5f; // Example: Adjust mesh density
+                Log("Scene Reconstruction (ARMeshManager) initialized and subscribed to meshesChanged.", ARManagerDebugFlags.ARSystem);
             }
-            catch (System.Exception e)
+            else if (!enableSceneReconstruction)
             {
-                LogError($"Error enabling ARMeshManager or interacting with its subsystem: {e.Message}. Disabling Scene Reconstruction.", ARManagerDebugFlags.ARSystem);
+                Log("Scene Reconstruction is disabled in settings. ARMeshManager will not be used.", ARManagerDebugFlags.ARSystem);
+                if (arMeshManager.subsystem != null && arMeshManager.subsystem.running) arMeshManager.subsystem.Stop();
                 arMeshManager.enabled = false;
-                enableSceneReconstruction = false;
+            }
+            else if (arMeshManager.subsystem == null || !arMeshManager.subsystem.running)
+            {
+                LogWarning("ARMeshManager subsystem is not available or not running. Scene Reconstruction might not work.", ARManagerDebugFlags.ARSystem);
+                // Optionally try to start it if it's just not started.
+                // if (arMeshManager.subsystem != null && !arMeshManager.subsystem.running) arMeshManager.subsystem.Start();
+                arMeshManager.enabled = false; // Disable component if subsystem not ready
             }
         }
         else
         {
-            LogWarning($"ARMeshManager subsystem is not available (subsystem is null). Disabling Scene Reconstruction and ARMeshManager.", ARManagerDebugFlags.ARSystem);
-            arMeshManager.enabled = false;
-            enableSceneReconstruction = false;
+            LogWarning("ARMeshManager not assigned. Scene Reconstruction cannot be initialized.", ARManagerDebugFlags.ARSystem);
         }
     }
+
 
     public void УстановитьОтображениеМаскиUI(UnityEngine.UI.RawImage rawImageДляУстановки)
     {
-        if (rawImageДляУстановки != null)
+        отображениеМаскиUI = rawImageДляУстановки;
+        if (отображениеМаскиUI != null)
         {
-            отображениеМаскиUI = rawImageДляУстановки;
-            отображениеМаскиUI.raycastTarget = false;
-            Log("Raycast Target disabled for mask UI.", ARManagerDebugFlags.Initialization, ARManagerLogLevel.Info);
-            if (currentSegmentationMask != null && отображениеМаскиUI.texture == null)
+            Log("RawImage для отображения маски UI установлено.", ARManagerDebugFlags.System);
+            if (currentSegmentationMask != null && currentSegmentationMask.IsCreated())
             {
                 отображениеМаскиUI.texture = currentSegmentationMask;
-                отображениеМаскиUI.gameObject.SetActive(true);
+                отображениеМаскиUI.color = Color.white; // Ensure it's visible
             }
         }
+        else
+        {
+            LogWarning("Попытка установить null RawImage для отображения маски UI.", ARManagerDebugFlags.System);
+        }
     }
+
 
     private void FindARComponents()
     {
-        Log($"[{this.GetType().Name}] FindARComponents: Method Entered (Direct Log - called from Awake/Start)", ARManagerDebugFlags.Initialization);
-        bool originFound = xrOrigin != null;
-        if (xrOrigin == null)
+        Log($"[{GetType().Name}] FindARComponents: Method Entered (Direct Log - called from Awake/Start)", ARManagerDebugFlags.Initialization);
+        bool originFound = this.xrOrigin != null;
+        if (this.xrOrigin == null)
         {
-            xrOrigin = FindObjectOfType<XROrigin>();
-            if (xrOrigin != null) Log("XROrigin found via FindObjectOfType.", ARManagerDebugFlags.Initialization);
+            this.xrOrigin = FindObjectOfType<XROrigin>();
+            if (this.xrOrigin != null) Log("XROrigin found via FindObjectOfType.", ARManagerDebugFlags.Initialization);
             else LogError("XROrigin NOT FOUND in scene! Many AR functions will fail.", ARManagerDebugFlags.Initialization);
         }
 
-        if (xrOrigin != null && arCameraManager == null) arCameraManager = xrOrigin.CameraFloorOffsetObject?.GetComponentInChildren<ARCameraManager>();
+        if (this.xrOrigin != null && arCameraManager == null) arCameraManager = this.xrOrigin.CameraFloorOffsetObject?.GetComponentInChildren<ARCameraManager>();
         if (arCameraManager == null) arCameraManager = FindObjectOfType<ARCameraManager>();
 
-        if (xrOrigin != null && planeManager == null) planeManager = xrOrigin.GetComponentInChildren<ARPlaneManager>();
+        if (this.xrOrigin != null && planeManager == null) planeManager = this.xrOrigin.GetComponentInChildren<ARPlaneManager>();
         if (planeManager == null) planeManager = FindObjectOfType<ARPlaneManager>();
 
-        if (xrOrigin != null && arRaycastManager == null) arRaycastManager = xrOrigin.GetComponentInChildren<ARRaycastManager>();
+        if (this.xrOrigin != null && arRaycastManager == null) arRaycastManager = this.xrOrigin.GetComponentInChildren<ARRaycastManager>();
         if (arRaycastManager == null) arRaycastManager = FindObjectOfType<ARRaycastManager>();
 
-        if (xrOrigin != null && arOcclusionManager == null) arOcclusionManager = xrOrigin.CameraFloorOffsetObject?.GetComponentInChildren<AROcclusionManager>();
+        if (this.xrOrigin != null && arOcclusionManager == null) arOcclusionManager = this.xrOrigin.CameraFloorOffsetObject?.GetComponentInChildren<AROcclusionManager>();
         if (arOcclusionManager == null) arOcclusionManager = FindObjectOfType<AROcclusionManager>();
 
-        if (xrOrigin != null && arMeshManager == null) arMeshManager = xrOrigin.GetComponentInChildren<ARMeshManager>();
+        if (this.xrOrigin != null && arMeshManager == null) arMeshManager = this.xrOrigin.GetComponentInChildren<ARMeshManager>();
         if (arMeshManager == null) arMeshManager = FindObjectOfType<ARMeshManager>();
 
-        if (xrOrigin != null && arAnchorManager == null) arAnchorManager = xrOrigin.GetComponentInChildren<ARAnchorManager>();
+        if (this.xrOrigin != null && arAnchorManager == null) arAnchorManager = this.xrOrigin.GetComponentInChildren<ARAnchorManager>();
         if (arAnchorManager == null) arAnchorManager = FindObjectOfType<ARAnchorManager>();
 
-        if (arDirectionalLight == null)
+        if (mainLight == null)
         {
             var lights = FindObjectsOfType<Light>();
-            arDirectionalLight = lights.FirstOrDefault(l => l.type == LightType.Directional);
-            if (arDirectionalLight != null) LogWarning("AR Directional Light auto-assigned. Please assign manually for reliability.", ARManagerDebugFlags.Initialization);
-            else LogWarning("AR Directional Light not assigned and not found. Light estimation may not work.", ARManagerDebugFlags.Initialization);
+            mainLight = lights.FirstOrDefault(l => l.type == LightType.Directional);
+            if (mainLight != null) LogWarning("AR Directional Light (mainLight) auto-assigned. Please assign manually for reliability.", ARManagerDebugFlags.Initialization);
+            else LogWarning("AR Directional Light (mainLight) not assigned and not found. Light estimation may not work.", ARManagerDebugFlags.Initialization);
         }
 
+        // WallSegmentation is typically assigned in Awake or via Inspector.
         if (wallSegmentation == null) wallSegmentation = FindObjectOfType<WallSegmentation>();
-        if (planeConfigurator == null) planeConfigurator = FindObjectOfType<ARPlaneConfigurator>();
+
 
         string report = "FindARComponents Report:\n";
-        report += $"  XROrigin: {(xrOrigin != null ? xrOrigin.name : "NULL")}{(originFound ? " (was pre-assigned)" : "")}\n";
+        report += $"  XROrigin: {(this.xrOrigin != null ? this.xrOrigin.name : "NULL")}{(originFound ? " (was pre-assigned)" : "")}\n";
         report += $"  ARCameraManager: {(arCameraManager != null ? "Found" : "NULL")}\n";
         report += $"  ARPlaneManager: {(planeManager != null ? "Found" : "NULL")}\n";
         report += $"  ARRaycastManager: {(arRaycastManager != null ? "Found" : "NULL")}\n";
-        report += $"  AROcclusionManager: {(arOcclusionManager != null ? "Found" : "NULL (Optional)")}\n";
+        report += $"  AROcclusionManager: {(arOcclusionManager != null ? "Found" : "NULL")}\n";
         report += $"  ARMeshManager: {(arMeshManager != null ? "Found" : "NULL")}\n";
         report += $"  ARAnchorManager: {(arAnchorManager != null ? "Found" : "NULL")}\n";
-        report += $"  AR Directional Light: {(arDirectionalLight != null ? arDirectionalLight.name : "NULL")}\n";
+        report += $"  AR Directional Light (mainLight): {(mainLight != null ? mainLight.name : "NULL")}\n";
         report += $"  WallSegmentation: {(wallSegmentation != null ? "Found" : "NULL")}\n";
-        report += $"  ARPlaneConfigurator: {(planeConfigurator != null ? "Found" : "NULL")}\n";
+        report += $"  ARPlaneConfigurator (from prefab): {(planeConfigurator != null ? "Found on prefab" : (arPaintPlanePrefab != null ? "Not on prefab" : "Prefab NULL"))}\n";
         Log(report, ARManagerDebugFlags.Initialization);
     }
 
+
     private void InitializeMaterials()
     {
-        if (verticalPlaneMaterial == null)
+        if (verticalPlaneMaterial == null) LogWarning("VerticalPlaneMaterial is not assigned.", ARManagerDebugFlags.Initialization);
+        if (horizontalPlaneMaterial == null) LogWarning("HorizontalPlaneMaterial is not assigned.", ARManagerDebugFlags.Initialization);
+        if (selectionMaterial == null) Log("SelectionMaterial is not assigned (optional).", ARManagerDebugFlags.Initialization);
+        if (wallPaintMaterial == null) LogWarning("WallPaintMaterial is not assigned. Painting will not work.", ARManagerDebugFlags.Initialization);
+
+        if (debugRayMaterialPropertyBlock == null)
         {
-            LogWarning("VerticalPlaneMaterial is not assigned. Using fallback Standard shader.", ARManagerDebugFlags.Initialization);
-            verticalPlaneMaterial = new Material(Shader.Find("Standard"));
+            debugRayMaterialPropertyBlock = new MaterialPropertyBlock();
         }
-        if (horizontalPlaneMaterial == null)
-        {
-            LogWarning("HorizontalPlaneMaterial is not assigned. Using fallback Standard shader.", ARManagerDebugFlags.Initialization);
-            horizontalPlaneMaterial = new Material(Shader.Find("Standard"));
-        }
+        Log("Materials initialized (checked for assignment).", ARManagerDebugFlags.Initialization);
     }
 
     private void OnARFrameReceived(ARCameraFrameEventArgs eventArgs)
     {
-        if (arDirectionalLight == null) return;
+        if (mainLight == null) return; // No light to update
+
         ARLightEstimationData lightEstimation = eventArgs.lightEstimation;
-        if (lightEstimation.averageBrightness.HasValue) arDirectionalLight.intensity = lightEstimation.averageBrightness.Value;
-        if (lightEstimation.averageColorTemperature.HasValue) arDirectionalLight.colorTemperature = lightEstimation.averageColorTemperature.Value;
-        if (lightEstimation.colorCorrection.HasValue) arDirectionalLight.color = lightEstimation.colorCorrection.Value;
-        if (lightEstimation.mainLightDirection.HasValue) arDirectionalLight.transform.rotation = Quaternion.LookRotation(lightEstimation.mainLightDirection.Value);
-        if (lightEstimation.mainLightIntensityLumens.HasValue) arDirectionalLight.intensity = lightEstimation.mainLightIntensityLumens.Value / 1000.0f;
+
+        if (lightEstimation.averageBrightness.HasValue)
+        {
+            mainLight.intensity = lightEstimation.averageBrightness.Value;
+        }
+        if (lightEstimation.averageColorTemperature.HasValue)
+        {
+            mainLight.colorTemperature = lightEstimation.averageColorTemperature.Value;
+        }
+        if (lightEstimation.colorCorrection.HasValue)
+        {
+            mainLight.color = lightEstimation.colorCorrection.Value;
+        }
+        // More advanced lighting updates can be added here, e.g., for mainLightDirection or sphericalHarmonicsL2.
+        if (lightEstimation.mainLightDirection.HasValue)
+        {
+            mainLight.transform.rotation = Quaternion.LookRotation(lightEstimation.mainLightDirection.Value);
+        }
+        if (lightEstimation.mainLightIntensityLumens.HasValue)
+        {
+            // Convert lumens to Unity intensity (this is an approximation and might need adjustment)
+            mainLight.intensity = lightEstimation.mainLightIntensityLumens.Value / 1000.0f; // Rough conversion
+        }
     }
+
 
     private void OnSegmentationMaskUpdated(RenderTexture mask)
     {
-        // Debug.Log($"[{this.GetType().Name}] OnSegmentationMaskUpdated RECEIVED MASK. Name: {mask?.name}, Width: {mask?.width}, Height: {mask?.height}, IsCreated: {mask?.IsCreated()} (Direct Log)");
-        Log($"OnSegmentationMaskUpdated RECEIVED MASK. Name: {mask?.name}, Width: {mask?.width}, Height: {mask?.height}, IsCreated: {mask?.IsCreated()}", ARManagerDebugFlags.System | ARManagerDebugFlags.PlaneGeneration);
-
         if (mask == null || !mask.IsCreated())
         {
-            LogWarning("OnSegmentationMaskUpdated: Received null or !IsCreated mask. Aborting.", ARManagerDebugFlags.PlaneGeneration);
+            LogWarning("OnSegmentationMaskUpdated received a null or uncreated mask.", ARManagerDebugFlags.PlaneGeneration);
             return;
         }
-        currentSegmentationMask = mask;
+        // Log($"OnSegmentationMaskUpdated: Received new mask. W:{mask.width}, H:{mask.height}. Frame: {frameCounter}", ARManagerDebugFlags.Performance);
 
-        if (!useDetectedPlanes)
-        {
-            if (wallSegmentation != null && wallSegmentation.TryGetLowResMask(out RenderTexture lrMask))
-            {
-                this.lowResSegmentationMask = lrMask;
-                newMaskAvailableForProcessing = true;
-                // Debug.Log($"[{this.GetType().Name}] OnSegmentationMaskUpdated: New low-res mask received (Name: {lrMask?.name}, W: {lrMask?.width}, H: {lrMask?.height}, Created: {lrMask?.IsCreated()}) and flagged for processing. (Direct Log)");
-                Log($"OnSegmentationMaskUpdated: New low-res mask received (Name: {lrMask?.name}, W: {lrMask?.width}, H: {lrMask?.height}, Created: {lrMask?.IsCreated()}) and flagged for processing.", ARManagerDebugFlags.PlaneGeneration);
-            }
-            else
-            {
-                // Debug.LogWarning($"[{this.GetType().Name}] OnSegmentationMaskUpdated: Could not get low-res mask from WallSegmentation. wallSegmentation null: {(wallSegmentation == null)} (Direct Log)");
-                LogWarning($"OnSegmentationMaskUpdated: Could not get low-res mask from WallSegmentation. wallSegmentation null: {(wallSegmentation == null)}", ARManagerDebugFlags.PlaneGeneration);
-            }
-        }
-        lastSuccessfulSegmentationTime = Time.time;
+        currentSegmentationMask = mask; // This is the high-resolution mask after WallSegmentation's processing
+        newMaskAvailableForProcessing = true;
+
         if (отображениеМаскиUI != null)
         {
-            отображениеМаскиUI.texture = currentSegmentationMask;
-            if (!отображениеМаскиUI.gameObject.activeSelf) отображениеМаскиUI.gameObject.SetActive(true);
+            if (отображениеМаскиUI.texture != currentSegmentationMask)
+            {
+                отображениеМаскиUI.texture = currentSegmentationMask;
+            }
+            if (отображениеМаскиUI.color != Color.white) отображениеМаскиUI.color = Color.white;
+        }
+
+        // If we're using segmentation for plane generation, process the mask
+        if (useSegmentationForPlaneGeneration && newMaskAvailableForProcessing)
+        {
+            ProcessSegmentationMask(currentSegmentationMask);
+            newMaskAvailableForProcessing = false; // Consumed the new mask
         }
     }
-
     private void OnMeshesChanged(ARMeshesChangedEventArgs args)
     {
-        Log($"OnMeshesChanged CALLED. Added: {args.added.Count}, Updated: {args.updated.Count}, Removed: {args.removed.Count}", ARManagerDebugFlags.ARSystem);
-        foreach (var meshFilter in args.added) EnsureMeshCollider(meshFilter);
-        foreach (var meshFilter in args.updated) EnsureMeshCollider(meshFilter);
-        if (args.removed.Count > 0) Log($"OnMeshesChanged: {args.removed.Count} mesh(es) removed.", ARManagerDebugFlags.ARSystem);
+        if ((this.debugFlags & ARManagerDebugFlags.ARSystem) != 0)
+        {
+            if (args.added.Count > 0) Log($"OnMeshesChanged: {args.added.Count} mesh(es) added.", ARManagerDebugFlags.ARSystem);
+            if (args.updated.Count > 0) Log($"OnMeshesChanged: {args.updated.Count} mesh(es) updated.", ARManagerDebugFlags.ARSystem);
+            if (args.removed.Count > 0) Log($"OnMeshesChanged: {args.removed.Count} mesh(es) removed.", ARManagerDebugFlags.ARSystem);
+        }
+        // Example: Add MeshColliders to new meshes for physics interaction
+        foreach (var meshFilter in args.added) { EnsureMeshCollider(meshFilter); }
+        foreach (var meshFilter in args.updated) { EnsureMeshCollider(meshFilter); }
     }
 
     private void EnsureMeshCollider(MeshFilter meshFilter)
@@ -601,220 +721,186 @@ public class ARManagerInitializer2 : MonoBehaviour
 
     private void ProcessSegmentationMask(RenderTexture maskToProcess)
     {
-        // Log($"ProcessSegmentationMask: ENTERED. MaskToProcess Name: {maskToProcess?.name}, IsCreated: {maskToProcess?.IsCreated()} (Direct Log)", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.System, ARManagerLogLevel.Info); // Direct log
-        Log($"ProcessSegmentationMask: ENTERED. MaskToProcess Name: {maskToProcess?.name}, IsCreated: {maskToProcess?.IsCreated()}", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.System);
-
-
-        if (maskToProcess == null || !maskToProcess.IsCreated())
+        string logPrefix = $"[{this.GetType().Name}] ProcessSegmentationMask:";
+        if ((this.debugFlags & (ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting)) != 0)
         {
-            // LogError($"ProcessSegmentationMask: maskToProcess is null or not created. Aborting. (Direct Log)", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.System);
-            LogError($"ProcessSegmentationMask: maskToProcess is null or not created. Aborting.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.System);
+            this.debugFlags |= ARManagerDebugFlags.SaveDebugTextures; // Ensure saving is enabled if we're debugging planes/rays
+        }
+
+        if (maskToProcess == null)
+        {
+            LogWarning(logPrefix + " maskToProcess is null. Aborting.", ARManagerDebugFlags.PlaneGeneration);
             return;
         }
 
-        // NEW: Save the low-resolution mask for debugging
-        if ((debugFlags & ARManagerDebugFlags.SaveDebugTextures) != 0) // MODIFIED: Control saving with SaveDebugTextures flag
+        Log($"ProcessSegmentationMask: Received mask. W:{maskToProcess.width}, H:{maskToProcess.height}. Format: {maskToProcess.format}. Frame: {frameCounter}", ARManagerDebugFlags.Performance);
+
+        if ((this.debugFlags & ARManagerDebugFlags.SaveDebugTextures) != 0)
         {
-            SaveLowResMaskForDebug(maskToProcess, $"LowResMaskInput_F{frameCounter}_C{lowResMaskSaveCounter++}.png");
-        }
-
-        Texture2D maskTexture = null;
-
-        // Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: About to call RenderTextureToTexture2D with mask: {maskToProcess.name}, W:{maskToProcess.width}, H:{maskToProcess.height} (Direct Log)");
-        Log($"ProcessSegmentationMask: About to call RenderTextureToTexture2D with mask: {maskToProcess.name}, W:{maskToProcess.width}, H:{maskToProcess.height}", ARManagerDebugFlags.PlaneGeneration);
-        maskTexture = RenderTextureToTexture2D(maskToProcess);
-
-        if (maskTexture == null)
-        {
-            // Debug.LogError($"[{this.GetType().Name}] ProcessSegmentationMask: RenderTextureToTexture2D returned null for maskToProcess '{maskToProcess.name}'. Aborting. (Direct Log)");
-            LogError($"ProcessSegmentationMask: RenderTextureToTexture2D returned null for maskToProcess '{maskToProcess.name}'. Aborting.", ARManagerDebugFlags.PlaneGeneration);
-            return;
-        }
-        // Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: RenderTextureToTexture2D returned a texture. Name: {maskTexture.name}, W:{maskTexture.width}, H:{maskTexture.height} (Direct Log)");
-        Log($"ProcessSegmentationMask: RenderTextureToTexture2D returned a texture. Name: {maskTexture.name}, W:{maskTexture.width}, H:{maskTexture.height}", ARManagerDebugFlags.PlaneGeneration);
-
-        Log($"ProcessSegmentationMask: maskTexture (from maskToProcess) created: {maskTexture.width}x{maskTexture.height}", ARManagerDebugFlags.PlaneGeneration);
-
-        Color32[] pixels = null;
-        int width = 0;
-        int height = 0;
-
-        try
-        {
-            // Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: About to call maskTexture.GetPixels32(). Texture: {maskTexture.name}, W:{maskTexture.width}, H:{maskTexture.height}, Format:{maskTexture.format}, Mipmaps:{maskTexture.mipmapCount} (Direct Log)");
-            Log($"ProcessSegmentationMask: About to call maskTexture.GetPixels32(). Texture: {maskTexture.name}, W:{maskTexture.width}, H:{maskTexture.height}, Format:{maskTexture.format}, Mipmaps:{maskTexture.mipmapCount}", ARManagerDebugFlags.PlaneGeneration);
-            pixels = maskTexture.GetPixels32();
-            Log($"[{this.GetType().Name}] ProcessSegmentationMask: maskTexture.GetPixels32() SUCCEEDED. Pixels array length: {pixels.Length}", ARManagerDebugFlags.PlaneGeneration); // Changed Debug.Log to Log
-
-            // NEW DETAILED PIXEL LOGGING
-            if (pixels != null && pixels.Length > 0)
+            if (wallSegmentation != null)
             {
-                System.Text.StringBuilder pixelLog = new System.Text.StringBuilder();
-                pixelLog.AppendLine($"[{GetType().Name}] ProcessSegmentationMask: Detailed Pixel Values (first 5 and some from middle/end) before FindWallAreas. Threshold: {wallAreaRedChannelThreshold}");
-                int step = pixels.Length / 10; // Log a few pixels spread out
-                if (step == 0) step = 1;
+                wallSegmentation.SaveTextureForDebug(maskToProcess, $"ARManagerInitializer2_ReceivedMask_F{frameCounter}");
+            }
+            else
+            {
+                SaveRenderTextureToFile(maskToProcess, $"ARManagerInitializer2_ReceivedMask_F{frameCounter}_Direct.png");
+            }
+        }
 
-                for (int i = 0; i < pixels.Length; i += (i < 20 || i > pixels.Length - 20) ? 1 : step) // Log more at start/end
+        // Attempt to get the low-resolution mask if WallSegmentation provides it
+        // This is conceptual; WallSegmentation needs to expose this.
+        bool gotLowRes = false;
+        if (wallSegmentation != null && wallSegmentation.TryGetLowResMask(out RenderTexture directLowResMask))
+        {
+            if (directLowResMask != null && directLowResMask.IsCreated())
+            {
+                Log($"Successfully got low-res mask ({directLowResMask.width}x{directLowResMask.height}) directly from WallSegmentation.", ARManagerDebugFlags.PlaneGeneration);
+                lowResSegmentationMask = directLowResMask; // Use it directly
+                if ((this.debugFlags & ARManagerDebugFlags.SaveDebugTextures) != 0)
                 {
-                    if (i < 5 || (i >= pixels.Length / 2 && i < pixels.Length / 2 + 5) || i >= pixels.Length - 5) // Check first 5, 5 from middle, last 5
-                    {
-                        pixelLog.AppendLine($"  Pixel[{i / (maskTexture?.width ?? 1)}, {i % (maskTexture?.width ?? 1)}] (Raw Index: {i}): R={pixels[i].r}, G={pixels[i].g}, B={pixels[i].b}, A={pixels[i].a} -> IsWall: {pixels[i].r >= wallAreaRedChannelThreshold}");
-                    }
-                    if (i > 200 && i < pixels.Length / 2) i = pixels.Length / 2 - 1; // Jump to middle after initial logs
-                    if (i > pixels.Length / 2 + 20 && i < pixels.Length - 20) i = pixels.Length - 20 - 1; // Jump to end after middle logs
+                    wallSegmentation.SaveTextureForDebug(lowResSegmentationMask, $"ARManagerInitializer2_LowResMask_F{frameCounter}_SourceDirect");
                 }
-                Log(pixelLog.ToString(), ARManagerDebugFlags.PlaneGeneration);
+                gotLowRes = true;
             }
-            // END NEW DETAILED PIXEL LOGGING
-
-            width = maskTexture.width;
-            height = maskTexture.height;
-        }
-        catch (Exception e)
-        {
-            // Debug.LogError($"[{this.GetType().Name}] ProcessSegmentationMask: EXCEPTION during maskTexture.GetPixels32(). Message: {e.Message}\\nTexture Info: Name={maskTexture?.name}, W={maskTexture?.width}, H={maskTexture?.height}, Format={maskTexture?.format}, IsReadable={maskTexture?.isReadable}\\nStackTrace: {e.StackTrace} (Direct Log)");
-            LogError($"ProcessSegmentationMask: EXCEPTION during maskTexture.GetPixels32(). Message: {e.Message}\nTexture Info: Name={maskTexture?.name}, W={maskTexture?.width}, H={maskTexture?.height}, Format={maskTexture?.format}, IsReadable={maskTexture?.isReadable}\nStackTrace: {e.StackTrace}", ARManagerDebugFlags.PlaneGeneration);
-            Destroy(maskTexture); // Destroy the texture if an error occurs
-            return; // Abort further processing
-        }
-        finally
-        {
-            // Always destroy the maskTexture after attempting to get pixels, regardless of success or failure, unless it was already destroyed in the catch block.
-            if (maskTexture != null) // Check if it wasn't destroyed in catch
+            else
             {
-                Destroy(maskTexture);
-                // Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: maskTexture destroyed in finally block. (Direct Log)");
-                Log($"ProcessSegmentationMask: maskTexture destroyed in finally block.", ARManagerDebugFlags.PlaneGeneration);
+                LogWarning("WallSegmentation.TryGetLowResMask returned true but mask was null or not created.", ARManagerDebugFlags.PlaneGeneration);
             }
         }
 
-        if (pixels == null)
+
+        if (!gotLowRes || lowResSegmentationMask == null) // If direct low-res not available, downsample current mask
         {
-            // Debug.LogError($"[{this.GetType().Name}] ProcessSegmentationMask: Pixels array is null after GetPixels32 attempt. Aborting. (Direct Log)");
-            LogError($"ProcessSegmentationMask: Pixels array is null after GetPixels32 attempt. Aborting.", ARManagerDebugFlags.PlaneGeneration);
+            Log("Low-res mask not directly available from WallSegmentation or failed to get. Downsampling high-res mask.", ARManagerDebugFlags.PlaneGeneration);
+            int lowResWidth = Mathf.Max(minPixelsDimensionForLowResArea, maskToProcess.width / 8); // Example downscale factor
+            int lowResHeight = Mathf.Max(minPixelsDimensionForLowResArea, maskToProcess.height / 8);
+
+            if (lowResSegmentationMask == null || lowResSegmentationMask.width != lowResWidth || lowResSegmentationMask.height != lowResHeight)
+            {
+                if (lowResSegmentationMask != null) lowResSegmentationMask.Release();
+                lowResSegmentationMask = new RenderTexture(lowResWidth, lowResHeight, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+                lowResSegmentationMask.name = "LowResSegMask_ARManager";
+                lowResSegmentationMask.Create();
+                Log($"Created/Recreated lowResSegmentationMask ({lowResWidth}x{lowResHeight}) for downsampling.", ARManagerDebugFlags.PlaneGeneration);
+            }
+            Graphics.Blit(maskToProcess, lowResSegmentationMask);
+            if ((this.debugFlags & ARManagerDebugFlags.SaveDebugTextures) != 0)
+            {
+                SaveRenderTextureToFile(lowResSegmentationMask, $"ARManagerInitializer2_LowResMask_F{frameCounter}_Downsampled.png");
+            }
+        }
+
+
+        if (lowResSegmentationMask == null || !lowResSegmentationMask.IsCreated())
+        {
+            LogError(logPrefix + " lowResSegmentationMask is null or not created after attempts. Aborting plane generation for this frame.", ARManagerDebugFlags.PlaneGeneration);
             return;
         }
 
-        List<Rect> wallAreas = FindWallAreas(pixels, width, height, wallAreaRedChannelThreshold);
-        Log($"ProcessSegmentationMask: FindWallAreas found {wallAreas.Count} areas from {width}x{height} mask. Threshold: {wallAreaRedChannelThreshold}", ARManagerDebugFlags.PlaneGeneration);
-        // Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: FindWallAreas returned {wallAreas.Count} areas. (Direct Log)");
-        Log($"ProcessSegmentationMask: FindWallAreas returned {wallAreas.Count} areas.", ARManagerDebugFlags.PlaneGeneration);
+        Texture2D tex2D = RenderTextureToTexture2D(lowResSegmentationMask); // Read pixels from low-res mask
+        if (tex2D == null)
+        {
+            LogError(logPrefix + " Failed to convert lowResSegmentationMask to Texture2D.", ARManagerDebugFlags.PlaneGeneration);
+            return;
+        }
+
+        Color32[] pixels = tex2D.GetPixels32();
+        Destroy(tex2D); // Clean up Texture2D immediately after getting pixels
+
+        List<Rect> wallAreas = FindWallAreas(pixels, lowResSegmentationMask.width, lowResSegmentationMask.height, wallMaskRedChannelMinThreshold);
+        Log($"Found {wallAreas.Count} wall areas in low-res mask (Threshold: {wallMaskRedChannelMinThreshold}).", ARManagerDebugFlags.PlaneGeneration);
 
         Dictionary<GameObject, bool> visitedPlanesInCurrentMask = new Dictionary<GameObject, bool>();
-        int processedAreas = 0;
-        Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: About to loop through {wallAreas.Count} found areas. (Direct Log)");
-        foreach (Rect area in wallAreas)
-        {
-            Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: LOOP_START for area {processedAreas + 1}/{wallAreas.Count}: {areaToString(area)} (Direct Log)");
-            Log($"ProcessSegmentationMask: Processing area {processedAreas + 1}/{wallAreas.Count}: {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
 
-            Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: Area W={area.width}, H={area.height}, Size={area.width * area.height}. MinDims={minPixelsDimensionForLowResArea}, MinAreaPx={minAreaSizeInLowResPixels} (Direct Log)");
-            if (area.width < minPixelsDimensionForLowResArea || area.height < minPixelsDimensionForLowResArea || (area.width * area.height) < minAreaSizeInLowResPixels)
+        if (wallAreas.Count > 0)
+        {
+            foreach (Rect area in wallAreas)
             {
-                Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: SKIPPING small area {areaToString(area)}. (Direct Log)");
-                Log($"Skipping small area on low-res mask: {areaToString(area)}. MinDims: {minPixelsDimensionForLowResArea}, MinAreaPx: {minAreaSizeInLowResPixels}", ARManagerDebugFlags.PlaneGeneration);
-                processedAreas++;
-                continue;
+                if ((this.debugFlags & ARManagerDebugFlags.PlaneGeneration) != 0)
+                {
+                    Log($"Processing wall area: {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
+                }
+                bool planeUpdatedOrCreated = UpdateOrCreatePlaneForWallArea(area, lowResSegmentationMask.width, lowResSegmentationMask.height, visitedPlanesInCurrentMask);
+                // Log($"Plane updated/created for area {areaToString(area)}: {planeUpdatedOrCreated}", ARManagerDebugFlags.PlaneGeneration);
             }
-            Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: Calling UpdateOrCreatePlaneForWallArea for area {areaToString(area)}. (Direct Log)");
-            bool planeProcessed = UpdateOrCreatePlaneForWallArea(area, width, height, visitedPlanesInCurrentMask);
-            Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: UpdateOrCreatePlaneForWallArea returned {planeProcessed} for area {areaToString(area)}. (Direct Log)");
-            Log($"ProcessSegmentationMask: UpdateOrCreatePlaneForWallArea returned {planeProcessed} for area {areaToString(area)}", ARManagerDebugFlags.PlaneGeneration);
-            processedAreas++;
-            Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: LOOP_END for area {processedAreas}/{wallAreas.Count}. (Direct Log)");
         }
-        Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: Finished looping through areas. Processed {processedAreas} areas. About to call CleanupOldPlanes. (Direct Log)");
+        else
+        {
+            Log("No significant wall areas found in the current segmentation mask to generate/update planes.", ARManagerDebugFlags.PlaneGeneration);
+        }
         CleanupOldPlanes(visitedPlanesInCurrentMask);
-        Log($"ProcessSegmentationMask FINISHED. Processed {processedAreas} areas.", ARManagerDebugFlags.PlaneGeneration);
-        Debug.Log($"[{this.GetType().Name}] ProcessSegmentationMask: METHOD_EXIT. (Direct Log)");
     }
+
+
+    public void SaveRenderTextureToFile(RenderTexture rt, string fileName)
+    {
+        if (rt == null) return;
+        RenderTexture activeRenderTexture = RenderTexture.active;
+        RenderTexture.active = rt;
+        Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
+        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = activeRenderTexture;
+
+        byte[] bytes = tex.EncodeToPNG();
+        Destroy(tex);
+
+        string path = Path.Combine(Application.persistentDataPath, "DebugTextures");
+        Directory.CreateDirectory(path); // Ensure directory exists
+        File.WriteAllBytes(Path.Combine(path, fileName), bytes);
+        Log($"Saved debug texture to {Path.Combine(path, fileName)}", ARManagerDebugFlags.SaveDebugTextures);
+    }
+
 
     private Texture2D RenderTextureToTexture2D(RenderTexture rTex)
     {
-        Log($"[{GetType().Name}] RenderTextureToTexture2D: Entered. rTex: {(rTex ? rTex.name : "null")}, W:{(rTex ? rTex.width : 0)}, H:{(rTex ? rTex.height : 0)}, Format:{(rTex ? rTex.format.ToString() : "N/A")}, IsCreated:{(rTex ? rTex.IsCreated().ToString() : "N/A")}", ARManagerDebugFlags.PlaneGeneration);
-
-        Texture2D tex = new Texture2D(rTex.width, rTex.height, TextureFormat.RGBA32, false); // MODIFIED: RGB24 to RGBA32
-        Log($"[{GetType().Name}] RenderTextureToTexture2D: Created Texture2D tex: {(tex ? tex.name : "null")}, W:{tex.width}, H:{tex.height}, Format:{tex.format}", ARManagerDebugFlags.PlaneGeneration);
-
-        RenderTexture previousActive = RenderTexture.active;
+        if (rTex == null) return null;
+        Texture2D tex = new Texture2D(rTex.width, rTex.height, TextureFormat.RGBA32, false);
+        RenderTexture currentActiveRT = RenderTexture.active;
         RenderTexture.active = rTex;
-        Debug.Log($"[{this.GetType().Name}] RenderTextureToTexture2D: Set RenderTexture.active to rTex ({rTex.name}). About to ReadPixels. (Direct Log)");
-
-        try
-        {
-            tex.ReadPixels(new Rect(0, 0, rTex.width, rTex.height), 0, 0);
-            Debug.Log($"[{this.GetType().Name}] RenderTextureToTexture2D: tex.ReadPixels() COMPLETED. (Direct Log)");
-
-            tex.Apply();
-            Debug.Log($"[{this.GetType().Name}] RenderTextureToTexture2D: tex.Apply() COMPLETED. (Direct Log)");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[{this.GetType().Name}] RenderTextureToTexture2D: EXCEPTION during ReadPixels or Apply. Message: {e.Message}\nStackTrace: {e.StackTrace} (Direct Log)");
-            RenderTexture.active = null; // Ensure active is cleared on error
-            Destroy(tex); // Cleanup partially created texture
-            return null;
-        }
-
-        RenderTexture.active = previousActive;
-        Debug.Log($"[{this.GetType().Name}] RenderTextureToTexture2D: Reset RenderTexture.active to null. Returning tex. (Direct Log)");
+        tex.ReadPixels(new Rect(0, 0, rTex.width, rTex.height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = currentActiveRT;
         return tex;
     }
 
     private List<Rect> FindWallAreas(Color32[] pixels, int width, int height, byte threshold)
     {
-        // Debug.Log($"[{this.GetType().Name}] FindWallAreas: ENTERED. Mask W:{width}, H:{height}, Threshold:{threshold} (Direct Log)");
-        Log($"FindWallAreas: ENTERED. Mask W:{width}, H:{height}, Threshold:{threshold}", ARManagerDebugFlags.PlaneGeneration);
         List<Rect> areas = new List<Rect>();
         bool[,] visited = new bool[width, height];
-        // Debug.Log($"[{this.GetType().Name}] FindWallAreas: Initialized visited array [{width},{height}] (Direct Log)");
-        Log($"FindWallAreas: Initialized visited array [{width},{height}]", ARManagerDebugFlags.PlaneGeneration);
+
         for (int y = 0; y < height; y++)
         {
             for (int x = 0; x < width; x++)
             {
-                // Debug.Log($"[{this.GetType().Name}] FindWallAreas: Checking pixel ({x},{y}) (Direct Log)"); // Potentially too spammy
-                if (!visited[x, y] && pixels[y * width + x].r > threshold)
+                if (!visited[x, y] && pixels[y * width + x].r >= threshold) // Assuming wall is in red channel
                 {
-                    // Debug.Log($"[{this.GetType().Name}] FindWallAreas: Found unvisited wall pixel at ({x},{y}). Value: {pixels[y * width + x].r}. Calling FindConnectedArea. (Direct Log)");
-                    Log($"FindWallAreas: Found unvisited wall pixel at ({x},{y}). Value: {pixels[y * width + x].r}. Calling FindConnectedArea.", ARManagerDebugFlags.PlaneGeneration);
                     Rect area = FindConnectedArea(pixels, width, height, x, y, visited, threshold);
-                    // Debug.Log($"[{this.GetType().Name}] FindWallAreas: FindConnectedArea returned {areaToString(area)} for start ({x},{y}). Adding to list. Areas count: {areas.Count + 1} (Direct Log)");
-                    Log($"FindWallAreas: FindConnectedArea returned {areaToString(area)} for start ({x},{y}). Adding to list. Areas count: {areas.Count + 1}", ARManagerDebugFlags.PlaneGeneration);
-                    areas.Add(area);
+                    if (area.width >= minPixelsDimensionForLowResArea && area.height >= minPixelsDimensionForLowResArea && (area.width * area.height) >= minAreaSizeInLowResPixels)
+                    {
+                        areas.Add(area);
+                    }
                 }
             }
         }
-        // Debug.Log($"[{this.GetType().Name}] FindWallAreas: EXITED. Found {areas.Count} areas. (Direct Log)");
-        Log($"FindWallAreas: EXITED. Found {areas.Count} areas.", ARManagerDebugFlags.PlaneGeneration);
         return areas;
     }
 
     private Rect FindConnectedArea(Color32[] pixels, int width, int height, int startX, int startY, bool[,] visited, byte threshold)
     {
-        // Debug.Log($"[{this.GetType().Name}] FindConnectedArea: ENTERED for start pixel ({startX},{startY}) (Direct Log)");
-        Log($"FindConnectedArea: ENTERED for start pixel ({startX},{startY})", ARManagerDebugFlags.PlaneGeneration);
         Queue<Vector2Int> queue = new Queue<Vector2Int>();
         queue.Enqueue(new Vector2Int(startX, startY));
         visited[startX, startY] = true;
-        int minX = startX, maxX = startX, minY = startY, maxY = startY;
-        int processedPixelCount = 0; // For loop runaway detection
+
+        int minX = startX, minY = startY, maxX = startX, maxY = startY;
 
         while (queue.Count > 0)
         {
-            processedPixelCount++;
-            if (processedPixelCount > width * height * 2)
-            { // Safety break for extremely large areas or potential infinite loops
-                // Debug.LogError($"[{this.GetType().Name}] FindConnectedArea: SAFETY BREAK! Processed pixel count exceeded {width * height * 2} for area starting at ({startX},{startY}). Aborting area search. Current Rect: X:{minX}, Y:{minY}, W:{maxX - minX + 1}, H:{maxY - minY + 1} (Direct Log)");
-                LogError($"FindConnectedArea: SAFETY BREAK! Processed pixel count exceeded {width * height * 2} for area starting at ({startX},{startY}). Aborting area search. Current Rect: X:{minX}, Y:{minY}, W:{maxX - minX + 1}, H:{maxY - minY + 1}", ARManagerDebugFlags.PlaneGeneration);
-                break;
-            }
-
             Vector2Int p = queue.Dequeue();
-            // Debug.Log($"[{this.GetType().Name}] FindConnectedArea: Dequeued ({p.x},{p.y}). Current bounds: minX={minX},maxX={maxX},minY={minY},maxY={maxY} (Direct Log)"); // Potentially too spammy
+
             minX = Mathf.Min(minX, p.x);
-            maxX = Mathf.Max(maxX, p.x);
             minY = Mathf.Min(minY, p.y);
+            maxX = Mathf.Max(maxX, p.x);
             maxY = Mathf.Max(maxY, p.y);
 
             for (int dy = -1; dy <= 1; dy++)
@@ -822,327 +908,300 @@ public class ARManagerInitializer2 : MonoBehaviour
                 for (int dx = -1; dx <= 1; dx++)
                 {
                     if (dx == 0 && dy == 0) continue;
+
                     int nx = p.x + dx;
                     int ny = p.y + dy;
 
                     // DETAILED LOGGING FOR NEIGHBOR CHECK
-                    if ((debugFlags & ARManagerDebugFlags.PlaneGeneration) != 0 && nx >= 0 && nx < width && ny >= 0 && ny < height) // GUARDED LOG
+                    if ((this.debugFlags & ARManagerDebugFlags.PlaneGeneration) != 0 && enableDetailedRaycastLogging && nx >= 0 && nx < width && ny >= 0 && ny < height) // GUARDED LOG
                     {
-                        // Debug.Log($"[{this.GetType().Name}] FindConnectedArea: Checking Neighbor ({nx},{ny}) of ({p.x},{p.y}). Pixel R-value: {pixels[ny * width + nx].r}, Visited: {visited[nx, ny]}, Threshold: {threshold} (Direct Log)");
-                        Log($"FindConnectedArea: Checking Neighbor ({nx},{ny}) of ({p.x},{p.y}). Pixel R-value: {pixels[ny * width + nx].r}, Visited: {visited[nx, ny]}, Threshold: {threshold}", ARManagerDebugFlags.PlaneGeneration);
+                        Log($"FindConnectedArea: Checking Neighbor({nx},{ny}) of({p.x},{p.y}). Pixel R-value: {pixels[ny * width + nx].r}, Visited: {visited[nx, ny]}, Threshold: {threshold} (Looking for R > threshold)", ARManagerDebugFlags.PlaneGeneration);
                     }
-                    // END DETAILED LOGGING
+
 
                     if (nx >= 0 && nx < width && ny >= 0 && ny < height &&
-                        !visited[nx, ny] && pixels[ny * width + nx].r > threshold)
+                        !visited[nx, ny] && pixels[ny * width + nx].r >= threshold)
                     {
-                        // Debug.Log($"[{this.GetType().Name}] FindConnectedArea: Neighbor ({nx},{ny}) IS wall and not visited. Enqueuing. (Direct Log)"); // MODIFIED LOG
-                        Log($"FindConnectedArea: Neighbor ({nx},{ny}) IS wall and not visited. Enqueuing.", ARManagerDebugFlags.PlaneGeneration);
                         visited[nx, ny] = true;
                         queue.Enqueue(new Vector2Int(nx, ny));
                     }
                 }
             }
         }
-        Rect resultRect = new Rect(minX, minY, maxX - minX + 1, maxY - minY + 1);
-        // Debug.Log($"[{this.GetType().Name}] FindConnectedArea: EXITED for start pixel ({startX},{startY}). Returning Rect: {areaToString(resultRect)}. Total pixels in queue processed: {processedPixelCount} (Direct Log)");
-        Log($"FindConnectedArea: EXITED for start pixel ({startX},{startY}). Returning Rect: {areaToString(resultRect)}. Total pixels in queue processed: {processedPixelCount}", ARManagerDebugFlags.PlaneGeneration);
-        return resultRect;
+        return new Rect(minX, minY, maxX - minX + 1, maxY - minY + 1);
     }
 
     private string areaToString(Rect area) => $"X:{area.x:F0}, Y:{area.y:F0}, W:{area.width:F0}, H:{area.height:F0}";
 
     private bool UpdateOrCreatePlaneForWallArea(Rect area, int textureWidth, int textureHeight, Dictionary<GameObject, bool> visitedPlanesInCurrentMask)
     {
-        string logPrefix = $"[UpdateOrCreatePlaneForWallArea] Area {areaToString(area)} (Tex: {textureWidth}x{textureHeight}) - ";
-        Log(logPrefix + "METHOD ENTRY.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
+        string logPrefix = $"[UpdateOrCreatePlaneForWallArea(Area:{areaToString(area)})] ";
+        Camera cam = this.xrOrigin != null ? this.xrOrigin.Camera : Camera.main;
 
-        bool planeCreatedOrUpdatedThisCall = false;
-
-        // Объявляем переменные здесь, чтобы они были доступны во всей области видимости метода
-        Vector3 planePosition = Vector3.zero;
-        Vector3 surfaceNormal = Vector3.forward; // Default to forward if no hit
-        float hitDistance = float.MaxValue;
-        bool validHitFound = false;
-        RaycastHit physicsHitInfo = new RaycastHit(); // Initialize with a default value
-        GameObject hitObject = null;
-
-
-        if (arCameraManager == null || arRaycastManager == null || arAnchorManager == null || planeManager == null || xrOrigin == null)
-        {
-            LogError(logPrefix + "One or more required AR components are null. Aborting.", ARManagerDebugFlags.PlaneGeneration);
-            return false;
-        }
-
-        Camera cam = arCameraManager.GetComponent<Camera>();
         if (cam == null)
         {
-            LogError(logPrefix + "ARCameraManager does not have a Camera component. Aborting.", ARManagerDebugFlags.PlaneGeneration);
+            LogError(logPrefix + "Camera not found. Cannot perform raycast.", ARManagerDebugFlags.PlaneGeneration);
             return false;
         }
 
-        Transform cameraTransform = cam.transform;
-        Vector2 screenCenterOfArea = area.center; // Используем центр области из маски
-        // Важно: ScreenPointToRay ожидает пиксельные координаты экрана, а не UV.
-        // screenCenterOfArea (area.center) уже в пикселях low-res маски.
-        // Нужно преобразовать их в координаты полного экрана, если arCameraManager.ScreenPointToRay этого ожидает.
-        // Однако, если cam это камера AR, ScreenPointToRay(pixelCoords) обычно работает с экранными пикселями.
-        // area.center относится к текстуре lowResSegmentationMask.
-        // Для преобразования в экранные координаты: (area.center.x / textureWidth) * Screen.width
-        // Но рейкаст должен исходить из центра ОБНАРУЖЕННОЙ области на экране.
-        // Проверим, как screenCenterOfArea соотносится с cam.ScreenPointToRay.
-        // Пока предполагаем, что ray из центра области на экране.
-        // Если рейкаст делается по low-res маске, то и координаты должны быть для нее.
-        // Но сам рейкаст идет в 3D мир из основной камеры.
-        // Для корректного преобразования UV-координат (0-1) в экранные: Vector2 screenPoint = new Vector2(uv.x * cam.pixelWidth, uv.y * cam.pixelHeight);
-        Vector2 uvCenter = new Vector2(area.center.x / textureWidth, area.center.y / textureHeight);
-        Vector2 screenPointForRay = new Vector2(uvCenter.x * cam.pixelWidth, uvCenter.y * cam.pixelHeight);
+        // Center of the detected area in low-res mask (normalized 0-1)
+        Vector2 normalizedCenter = new Vector2((area.x + area.width / 2f) / textureWidth, (area.y + area.height / 2f) / textureHeight);
+        Vector2 screenPoint = new Vector2(normalizedCenter.x * cam.pixelWidth, normalizedCenter.y * cam.pixelHeight);
 
-        Ray ray = cam.ScreenPointToRay(screenPointForRay);
-        Log(logPrefix + $"Ray created from UV {uvCenter.ToString("F3")} -> ScreenPt {screenPointForRay.ToString("F0")} : Origin={ray.origin.ToString("F3")}, Direction={ray.direction.ToString("F3")}", ARManagerDebugFlags.Raycasting);
-        if ((debugFlags & ARManagerDebugFlags.Raycasting) != 0) Debug.DrawRay(ray.origin, ray.direction * maxRayDistance, Color.yellow, 2.0f);
+        string planeIdentifier = GeneratePlaneIdentifier(area, textureWidth, textureHeight);
+        GameObject hitSurfaceObject = null; // The actual world object hit by the raycast
+        Pose hitPose = default;
+        bool hitSuccess = false;
+        Vector2 hitUV = Vector2.zero; // UV coordinates on the hit surface, if applicable
 
+        // Perform Raycast
         List<ARRaycastHit> arHits = new List<ARRaycastHit>();
-        bool arHitDetected = false;
-        Pose arHitPose = Pose.identity;
-        float closestARHitDistance = float.MaxValue;
-        ARRaycastHit bestARHit = new ARRaycastHit(); // Store the best AR hit
-
-        //string trackableTypesToLog = TrackableType.PlaneWithinPolygon.ToString();
-        //Log(logPrefix + $"Attempting ARRaycast against TrackableType: {trackableTypesToLog}...", ARManagerDebugFlags.Raycasting);
-        //if (arRaycastManager.Raycast(ray, arHits, TrackableType.PlaneWithinPolygon))
-        string trackableTypesToLog = TrackableType.All.ToString(); // MODIFIED: Broaden to All
-        Log(logPrefix + $"Attempting ARRaycast against TrackableType: {trackableTypesToLog}...", ARManagerDebugFlags.Raycasting);
-        if (arRaycastManager.Raycast(ray, arHits, TrackableType.All)) // MODIFIED: Use TrackableType.All
+        bool arHitSuccess = false;
+        if (arRaycastManager != null && useDetectedPlanesForTap) // useDetectedPlanesForTap can double for "use AR Raycast"
         {
-            Log(logPrefix + $"ARRaycastManager.Raycast returned {arHits.Count} hit(s). Processing...", ARManagerDebugFlags.Raycasting);
-            foreach (var hit in arHits)
+            arHitSuccess = arRaycastManager.Raycast(screenPoint, arHits, trackableTypesToHit);
+            if (arHitSuccess)
             {
-                float distanceToHit = Vector3.Distance(cameraTransform.position, hit.pose.position);
-                Log(logPrefix + $"  Checking AR hit: Type={hit.hitType}, TrackableId={hit.trackableId}, PosePos={hit.pose.position.ToString("F3")}, ARDist={hit.distance:F2}, CalcDist={distanceToHit:F2}", ARManagerDebugFlags.Raycasting);
+                hitPose = arHits[0].pose;
+                hitSuccess = true;
+                // Try to get the ARPlane GameObject
+                ARPlane plane = planeManager?.GetPlane(arHits[0].trackableId);
+                if (plane != null) hitSurfaceObject = plane.gameObject;
 
-                if (Vector3.Dot(cameraTransform.forward, (hit.pose.position - cameraTransform.position).normalized) > 0.1f) // Хит должен быть достаточно впереди
+                Log(logPrefix + $"AR Raycast hit AR Plane: {hitSurfaceObject?.name ?? "Unknown AR Plane"} at {hitPose.position.ToString("F3")}", ARManagerDebugFlags.Raycasting);
+            }
+        }
+
+        // Physics Raycast as primary or fallback
+        Ray ray = cam.ScreenPointToRay(screenPoint);
+        if (alwaysUsePhysicsRaycastForCustomPlanes || !hitSuccess) // If always using physics OR AR raycast failed
+        {
+            if (Physics.Raycast(ray, out RaycastHit physicsHit, maxRayDistance, hitLayerMask))
+            {
+                // Check if we hit an ignored object first
+                if (IsIgnoredObject(physicsHit.collider.gameObject))
                 {
-                    if (distanceToHit < closestARHitDistance && distanceToHit < maxRayDistance)
-                    {
-                        closestARHitDistance = distanceToHit;
-                        bestARHit = hit;
-                        arHitDetected = true;
-                        Log(logPrefix + $"    Found new BEST AR candidate. Dist: {closestARHitDistance:F2}", ARManagerDebugFlags.Raycasting);
-                    }
-                    else
-                    {
-                        Log(logPrefix + $"    AR Hit not closer or too far. HitDist: {distanceToHit:F2}, ClosestKnown: {closestARHitDistance:F2}, MaxDist: {maxRayDistance:F2}", ARManagerDebugFlags.Raycasting);
-                    }
+                    Log(logPrefix + $"Physics Raycast hit an IGNORED object: {physicsHit.collider.name}. No plane will be created/updated here based on this hit.", ARManagerDebugFlags.Raycasting);
+                }
+                else if (physicsHit.distance >= minHitDistanceThreshold)
+                {
+                    hitPose = new Pose(physicsHit.point, Quaternion.LookRotation(-physicsHit.normal)); // Plane normal is opposite to hit normal
+                    hitSurfaceObject = physicsHit.collider.gameObject;
+                    hitUV = physicsHit.textureCoord; // Store UV if available
+                    hitSuccess = true;
+                    Log(logPrefix + $"Physics Raycast hit: {hitSurfaceObject.name} at {hitPose.position.ToString("F3")}, Normal: {physicsHit.normal.ToString("F3")}, Dist: {physicsHit.distance:F2}. Layer: {LayerMask.LayerToName(hitSurfaceObject.layer)}", ARManagerDebugFlags.Raycasting);
                 }
                 else
                 {
-                    Log(logPrefix + "    AR Hit is behind or too close to camera forward plane.", ARManagerDebugFlags.Raycasting);
+                    Log(logPrefix + $"Physics Raycast hit too close: {physicsHit.collider.name} at distance {physicsHit.distance:F2}. Min threshold: {minHitDistanceThreshold}.", ARManagerDebugFlags.Raycasting);
                 }
             }
-
-            if (arHitDetected)
+            else
             {
-                arHitPose = bestARHit.pose;
-                if (bestARHit.trackable is ARPlane planeTrackable) { surfaceNormal = planeTrackable.normal; }
-                // Для FeaturePoint или других типов, нормаль может быть менее надежной.
-                // Использование -cameraTransform.forward хорошее предположение, если нет других данных.
-                // Однако, если позже Physics.Raycast даст более точную нормаль, она будет использована.
-                else
+                Log(logPrefix + "Physics Raycast did not hit any surface within range or layer mask.", ARManagerDebugFlags.Raycasting);
+            }
+        }
+
+
+        if ((this.debugFlags & ARManagerDebugFlags.Raycasting) != 0 && drawDebugRays)
+        {
+            Color rayColor = hitSuccess ? Color.green : (arHitSuccess ? Color.blue : Color.red); // Green for final phys, Blue for AR, Red for miss
+            DrawDebugRay(ray, rayColor, 2.0f);
+            if ((this.debugFlags & ARManagerDebugFlags.DetailedRaycastLogging) != 0)
+            {
+                Log(logPrefix + $"[RayDebug] Cam: {cam.name}, Pos: {cam.transform.position.ToString("F3")}, Fwd: {cam.transform.forward.ToString("F3")}", ARManagerDebugFlags.Raycasting | ARManagerDebugFlags.DetailedRaycastLogging);
+                Log(logPrefix + $"[RayDebug] Ray O: {ray.origin.ToString("F3")}, D: {ray.direction.ToString("F3")}", ARManagerDebugFlags.Raycasting | ARManagerDebugFlags.DetailedRaycastLogging);
+            }
+            else if ((this.debugFlags & ARManagerDebugFlags.Raycasting) != 0)
+            {
+                Log(logPrefix + "Raycast initiated (detailed ray params not logged).", ARManagerDebugFlags.Raycasting);
+            }
+        }
+
+
+        if (hitSuccess)
+        {
+            if (hitSurfaceObject != null && LayerMask.LayerToName(hitSurfaceObject.layer) == basicSceneGeometryLayerName)
+            {
+                Log(logPrefix + $"Hit surface '{hitSurfaceObject.name}' is part of basic scene geometry. Proceeding to create/update paint plane.", ARManagerDebugFlags.PlaneGeneration);
+            }
+            else if (hitSurfaceObject != null && IsARFoundationPlane(hitSurfaceObject))
+            {
+                Log(logPrefix + $"Hit surface '{hitSurfaceObject.name}' is an ARFoundation plane. Will use its pose.", ARManagerDebugFlags.PlaneGeneration);
+            }
+
+
+            // Filter by plane normal relative to camera forward
+            Vector3 cameraForwardOnHitPlane = Vector3.ProjectOnPlane(cam.transform.forward, hitPose.up).normalized;
+            float angle = Vector3.Angle(cameraForwardOnHitPlane, -hitPose.forward); // -hitPose.forward is the direction the plane is "facing"
+
+            if (angle <= maxCameraAngleToPlaneNormal)
+            {
+                GameObject planeGO = CreateOrUpdateARPaintPlane(area, hitPose, hitSurfaceObject, visitedPlanesInCurrentMask, hitUV, planeIdentifier);
+                if (planeGO != null)
                 {
-                    surfaceNormal = -cameraTransform.forward;
-                    Log(logPrefix + "  AR Hit was not an ARPlane, using -camera.forward as initial normal.", ARManagerDebugFlags.Raycasting);
+                    visitedPlanesInCurrentMask[planeGO] = true; // Mark as visited/updated in this frame
+                    return true;
                 }
-                planePosition = arHitPose.position;
-                hitDistance = closestARHitDistance; // Обновляем общую hitDistance
-                validHitFound = true;
-                Log(logPrefix + $"ARRaycast FINAL SUCCESS. Best Hit TrackableId: {bestARHit.trackableId}, Type: {bestARHit.hitType}, FinalDist: {hitDistance:F2}, Pos: {planePosition.ToString("F2")}, Normal: {surfaceNormal.ToString("F2")}", ARManagerDebugFlags.Raycasting);
             }
             else
             {
-                Log(logPrefix + "ARRaycast hits were present but none were deemed valid (too far, behind camera, etc.).", ARManagerDebugFlags.Raycasting);
+                Log(logPrefix + $"Plane creation skipped: Angle between camera forward ({cameraForwardOnHitPlane.ToString("F3")}) and plane normal ({(-hitPose.forward).ToString("F3")}) is {angle:F1}°, which is > max ({maxCameraAngleToPlaneNormal}°).", ARManagerDebugFlags.PlaneGeneration);
             }
         }
-        else
+        else // No hit, create a fallback plane at a default distance
         {
-            Log(logPrefix + "ARRaycastManager found NO hits at all.", ARManagerDebugFlags.Raycasting);
-        }
+            if (defaultPlaneDistance >= minPlaneCreationDistance)
+            {
+                Log(logPrefix + "No surface hit by raycast. Creating fallback plane.", ARManagerDebugFlags.PlaneGeneration);
+                Vector3 planePosition = cam.transform.position + cam.transform.forward * defaultPlaneDistance;
+                Quaternion planeRotation = Quaternion.LookRotation(-cam.transform.forward, cam.transform.up); // Facing the camera
+                hitPose = new Pose(planePosition, planeRotation);
 
-        Log(logPrefix + $"Attempting Physics.Raycast... Current best hitDistance (from AR): {hitDistance:F2}", ARManagerDebugFlags.Raycasting);
-        if (Physics.Raycast(ray, out physicsHitInfo, maxRayDistance, hitLayerMask))
-        {
-            Log(logPrefix + $"Physics.Raycast hit object '{physicsHitInfo.collider.name}' at distance {physicsHitInfo.distance:F2}m. Normal: {physicsHitInfo.normal.ToString("F2")}", ARManagerDebugFlags.Raycasting);
-            if (IsIgnoredObject(physicsHitInfo.collider.gameObject))
-            {
-                Log(logPrefix + "  Physics hit an IGNORED object. No change to validHitFound.", ARManagerDebugFlags.Raycasting);
-            }
-            // Если Physics.Raycast попал БЛИЖЕ, чем существующий ARRaycast (или если ARRaycast не дал валидного хита, тогда hitDistance все еще float.MaxValue)
-            else if (physicsHitInfo.distance < hitDistance - 0.01f) // Добавляем небольшой порог, чтобы избежать Z-fighting при почти одинаковых расстояниях
-            {
-                Log(logPrefix + $"Physics.Raycast OVERRODE ARRaycast or was the ONLY valid hit. Old AR dist: {hitDistance:F2}, New Phys dist: {physicsHitInfo.distance:F2}. Updating plane info.", ARManagerDebugFlags.Raycasting);
-                planePosition = physicsHitInfo.point;
-                surfaceNormal = physicsHitInfo.normal;
-                hitDistance = physicsHitInfo.distance;
-                validHitFound = true; // Этот хит теперь валидный
-                hitObject = physicsHitInfo.collider.gameObject; // Запоминаем объект, если понадобится
-                arHitPose = Pose.identity; // Сбрасываем AR хит, так как физический хит имеет приоритет для позиции/нормали
+                GameObject planeGO = CreateOrUpdateARPaintPlane(area, hitPose, null, visitedPlanesInCurrentMask, Vector2.zero, planeIdentifier); // No hit surface object
+                if (planeGO != null)
+                {
+                    visitedPlanesInCurrentMask[planeGO] = true;
+                    return true;
+                }
             }
             else
             {
-                Log(logPrefix + $"Physics.Raycast hit was NOT closer (PhysD: {physicsHitInfo.distance:F2} vs ARD: {hitDistance:F2}). Current valid hit (if any) from ARRaycast remains preferred.", ARManagerDebugFlags.Raycasting);
-            }
-        }
-        else
-        {
-            Log(logPrefix + "Physics.Raycast found NO hits within range or layer.", ARManagerDebugFlags.Raycasting);
-        }
-
-        if (!validHitFound)
-        {
-            Log(logPrefix + "No valid AR or Physics hit found after all checks. Plane will NOT be created. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration | ARManagerDebugFlags.Raycasting);
-            if ((debugFlags & ARManagerDebugFlags.Raycasting) != 0) Debug.DrawRay(ray.origin, ray.direction * maxRayDistance, Color.magenta, 2.0f);
-            return false;
-        }
-        Log(logPrefix + $"FINAL VALID HIT CHOSEN. Position: {planePosition.ToString("F2")}, Normal: {surfaceNormal.ToString("F2")}, Distance: {hitDistance:F2}. Was AR Hit anchored: {arHitPose != Pose.identity}", ARManagerDebugFlags.PlaneGeneration);
-
-        Log(logPrefix + "Checking if surface is vertical... Normal: " + surfaceNormal.ToString("F3"), ARManagerDebugFlags.PlaneGeneration);
-        if (!IsSurfaceVertical(surfaceNormal))
-        {
-            Log(logPrefix + $"Surface normal {surfaceNormal.ToString("F2")} is NOT vertical enough (max angle: {maxWallNormalAngleDeviation}). Plane creation SKIPPED. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration);
-            return false;
-        }
-        Log(logPrefix + "Surface IS vertical. Proceeding to create/update plane.", ARManagerDebugFlags.PlaneGeneration);
-
-        // --- Существующая логика создания новой плоскости (или обновления существующей) должна быть здесь ---
-        // Временно упрощенный код создания новой плоскости для теста:
-        Log(logPrefix + "Proceeding to create a NEW plane (existing plane update logic temporarily bypassed for detailed logging test).", ARManagerDebugFlags.PlaneGeneration);
-
-        GameObject newPlaneGo = new GameObject($"GeneratedWallPlane_{planeInstanceCounter++}");
-        Transform parentToUse = null;
-        if (xrOrigin != null && xrOrigin.TrackablesParent != null)
-        {
-            parentToUse = xrOrigin.TrackablesParent;
-        }
-        else
-        {
-            LogWarning(logPrefix + "xrOrigin.TrackablesParent is null. Plane will be at root.", ARManagerDebugFlags.PlaneGeneration);
-            // parentToUse remains null, plane will be at root
-        }
-
-        if (parentToUse != null)
-        {
-            newPlaneGo.transform.SetParent(parentToUse, false);
-        }
-
-        newPlaneGo.layer = LayerMask.NameToLayer(planeLayerName);
-        newPlaneGo.transform.position = planePosition;
-        newPlaneGo.transform.rotation = Quaternion.LookRotation(-surfaceNormal, Vector3.up);
-
-        Log(logPrefix + $"Set new plane '{newPlaneGo.name}' Transform: Pos={planePosition.ToString("F2")}, RotQ={newPlaneGo.transform.rotation.ToString("F3")}, Parent={(parentToUse != null ? parentToUse.name : "Root")}", ARManagerDebugFlags.PlaneGeneration);
-
-        // TODO: Рассчитать реальные мировые размеры плоскости на основе hitDistance, FOV камеры и UV-размеров области `area`.
-        // Vector2 planeSizeInWorld = CalculateWorldSizeOfArea(area, textureWidth, textureHeight, hitDistance, cam);
-        // Mesh planeMesh = CreatePlaneMesh(planeSizeInWorld.x, planeSizeInWorld.y);
-        // Используем временные размеры для меша, пока не будет точного расчета мировых размеров
-        Mesh planeMesh = CreatePlaneMesh(0.5f, 0.5f); // Временный размер 0.5x0.5 метра для заметности
-        LogWarning(logPrefix + $"Created plane with TEMPORARY {planeMesh.bounds.size.x}x{planeMesh.bounds.size.y} meter size. Implement actual world size calculation.", ARManagerDebugFlags.PlaneGeneration);
-
-        MeshFilter meshFilter = newPlaneGo.AddComponent<MeshFilter>();
-        meshFilter.mesh = planeMesh;
-
-        MeshRenderer meshRenderer = newPlaneGo.AddComponent<MeshRenderer>();
-        Material matToAssign = GetMaterialForPlane(surfaceNormal, PlaneAlignment.Vertical); // Принудительно вертикальный, т.к. IsSurfaceVertical пройдена
-        if (matToAssign == null)
-        {
-            LogError(logPrefix + $"GetMaterialForPlane returned null for normal {surfaceNormal} (expected vertical). Cannot assign material. Aborting plane creation.", ARManagerDebugFlags.PlaneGeneration);
-            Destroy(newPlaneGo);
-            return false;
-        }
-        meshRenderer.material = matToAssign;
-        Log(logPrefix + $"Assigned material '{matToAssign.name}' to plane '{newPlaneGo.name}'.", ARManagerDebugFlags.PlaneGeneration);
-
-        MeshCollider meshCollider = newPlaneGo.AddComponent<MeshCollider>();
-        meshCollider.sharedMesh = planeMesh;
-        meshCollider.convex = false;
-
-        ARAnchor anchor = null;
-        // Приоритет отдаем созданию якоря на основе ARRaycastHit, если он был источником validHitFound и arHitPose не сброшен
-        if (arHitPose != Pose.identity)
-        {
-            anchor = arAnchorManager.AddAnchor(arHitPose);
-            Log(logPrefix + (anchor ? $"ARAnchor created from ARRaycastHit ({arHitPose.position.ToString("F2")}) for '{newPlaneGo.name}'."
-                                     : $"Failed to create ARAnchor from ARRaycastHit for '{newPlaneGo.name}'."), ARManagerDebugFlags.PlaneGeneration);
-        }
-        // Если arHitPose был сброшен (т.е. Physics hit имел приоритет) или AR хит не дал якоря, пробуем создать якорь по финальной planePosition
-        else if (validHitFound && anchor == null)
-        {
-            Pose physicsBasedPose = new Pose(planePosition, newPlaneGo.transform.rotation);
-            anchor = arAnchorManager.AddAnchor(physicsBasedPose);
-            Log(logPrefix + (anchor ? $"ARAnchor created from final plane pose (likely Physics based: {planePosition.ToString("F2")}) for '{newPlaneGo.name}'."
-                                     : $"Failed to create ARAnchor from final plane pose for '{newPlaneGo.name}'."), ARManagerDebugFlags.PlaneGeneration);
-        }
-
-        if (anchor)
-        {
-            newPlaneGo.transform.SetParent(anchor.transform, true); // World position Stays
-            Log(logPrefix + $"Successfully parented '{newPlaneGo.name}' to ARAnchor '{anchor.name}'.", ARManagerDebugFlags.PlaneGeneration);
-        }
-        else
-        {
-            LogWarning(logPrefix + $"Plane '{newPlaneGo.name}' created WITHOUT an ARAnchor.", ARManagerDebugFlags.PlaneGeneration);
-        }
-
-        generatedPlanes.Add(newPlaneGo);
-        if (persistentGeneratedPlanes.ContainsKey(newPlaneGo)) persistentGeneratedPlanes[newPlaneGo] = false;
-        else persistentGeneratedPlanes.Add(newPlaneGo, false);
-
-        if (planeCreationTimes.ContainsKey(newPlaneGo)) planeCreationTimes[newPlaneGo] = Time.time;
-        else planeCreationTimes.Add(newPlaneGo, Time.time);
-
-        if (planeLastVisitedTime.ContainsKey(newPlaneGo)) planeLastVisitedTime[newPlaneGo] = Time.time;
-        else planeLastVisitedTime.Add(newPlaneGo, Time.time);
-
-        planeCreatedOrUpdatedThisCall = true;
-        visitedPlanesInCurrentMask[newPlaneGo] = true;
-
-        Log(logPrefix + $"New plane '{newPlaneGo.name}' created successfully. METHOD EXIT.", ARManagerDebugFlags.PlaneGeneration);
-        return planeCreatedOrUpdatedThisCall;
-    }
-
-    private bool IsIgnoredObject(GameObject obj)
-    {
-        if (obj.CompareTag("Player")) return true;
-        if (!string.IsNullOrEmpty(ignoreObjectNames))
-        {
-            string[] names = ignoreObjectNames.Split(',');
-            foreach (string name in names)
-            {
-                if (obj.name.Contains(name.Trim())) return true;
+                Log(logPrefix + $"Fallback plane creation skipped: defaultPlaneDistance {defaultPlaneDistance}m < minPlaneCreationDistance {minPlaneCreationDistance}m.", ARManagerDebugFlags.PlaneGeneration);
             }
         }
         return false;
     }
 
-    private bool IsSurfaceVertical(Vector3 normal)
+    private GameObject CreateOrUpdateARPaintPlane(Rect associatedArea, Pose hitPose, GameObject hitSurfaceObject, Dictionary<GameObject, bool> visitedPlanesInCurrentMask, Vector2 uvPoint, string planeIdentifier)
     {
-        float angleWithUp = Vector3.Angle(normal, Vector3.up);
-        return angleWithUp > (90f - maxWallNormalAngleDeviation) && angleWithUp < (90f + maxWallNormalAngleDeviation);
+        string logPrefix = $"[CreateOrUpdateARPaintPlane(Area:{areaToString(associatedArea)}, HitSurface:{hitSurfaceObject?.name ?? "Fallback/None"}, ID:{planeIdentifier})] ";
+        Camera cam = this.xrOrigin != null ? this.xrOrigin.Camera : Camera.main;
+
+        if (cam == null)
+        {
+            LogError(logPrefix + "Camera is null. Cannot proceed.", ARManagerDebugFlags.PlaneGeneration);
+            return null;
+        }
+
+        GameObject existingPlane = FindClosestExistingPlane(hitPose.position, planeIdentifier);
+
+        if (existingPlane != null && (hitPose.position - existingPlane.transform.position).magnitude < planeMergeDistanceThreshold)
+        {
+            Log(logPrefix + $"Updating existing plane '{existingPlane.name}'.", ARManagerDebugFlags.PlaneGeneration);
+            existingPlane.transform.SetPositionAndRotation(hitPose.position, hitPose.rotation);
+            // Optionally update scale or other properties if needed
+            planeLastVisitedTime[existingPlane] = Time.time;
+            return existingPlane;
+        }
+        else
+        {
+            if (arPaintPlanePrefab == null)
+            {
+                LogError(logPrefix + "arPaintPlanePrefab is null. Cannot create new plane.", ARManagerDebugFlags.PlaneGeneration);
+                return null;
+            }
+
+            Log(logPrefix + $"Creating new plane. ID: {planeIdentifier}", ARManagerDebugFlags.PlaneGeneration);
+            GameObject newPlane = Instantiate(arPaintPlanePrefab, hitPose.position, hitPose.rotation);
+            newPlane.name = $"ARPaintPlane_{planeInstanceCounter++}_{planeIdentifier}";
+            newPlane.transform.localScale = defaultPlaneScale;
+
+            // Set layer
+            int layer = LayerMask.NameToLayer(planeLayerName);
+            if (layer != -1) newPlane.layer = layer;
+            else LogWarning(logPrefix + $"Layer '{planeLayerName}' not found. Plane may not behave as expected.", ARManagerDebugFlags.PlaneGeneration);
+
+
+            ARPlaneConfigurator configurator = newPlane.GetComponent<ARPlaneConfigurator>();
+            if (configurator != null)
+            {
+                // Old calls:
+                // configurator.InitializePlane(hitSurfaceObject, associatedArea, uvPoint, hitPose.up);
+                // PlaneAlignment alignment = IsSurfaceVertical(hitPose.up) ? PlaneAlignment.Vertical : (Vector3.Dot(hitPose.up, Vector3.up) > horizontalSurfaceThreshold ? PlaneAlignment.HorizontalUp : PlaneAlignment.HorizontalDown);
+                // configurator.ApplyMaterial(GetMaterialForPlane(hitPose.up, alignment));
+
+                // New call:
+                // Assuming newPlane might not have an ARPlane component if it's a generic prefab,
+                // but ARPlaneConfigurator.ConfigurePlane expects an ARPlane.
+                // This might need adjustment if newPlane is not itself an ARPlane or lacks the component.
+                ARPlane arPlaneComponent = newPlane.GetComponent<ARPlane>();
+                if (arPlaneComponent != null)
+                {
+                    configurator.ConfigurePlane(arPlaneComponent, this.wallSegmentation, this);
+                }
+                else
+                {
+                    LogWarning(logPrefix + $"ARPlane component not found on instantiated plane '{newPlane.name}'. Cannot fully configure with ARPlaneConfigurator.", ARManagerDebugFlags.PlaneGeneration);
+                    // Potentially, we could call a different method on configurator that doesn't require ARPlane,
+                    // or ARPlaneConfigurator needs to be more flexible for non-ARPlane GameObjects.
+                    // For now, full configuration is skipped if no ARPlane component.
+                }
+            }
+            else if (this.planeConfigurator != null) // Fallback to assign global one if prefab didn't have one
+            {
+                LogWarning(logPrefix + $"Instantiated arPaintPlanePrefab '{newPlane.name}' does not have an ARPlaneConfigurator. Attempting to use scene default if available, but this is not ideal.", ARManagerDebugFlags.PlaneGeneration);
+                // This path is less ideal as the configurator might not be set up for this specific plane's context.
+            }
+
+
+            generatedPlanes.Add(newPlane);
+            allGeneratedPlanes.Add(newPlane);
+            activePlanesForPainting.Add(newPlane);
+            planeCreationTimes[newPlane] = Time.time;
+            planeLastVisitedTime[newPlane] = Time.time;
+            persistentGeneratedPlanes.TryAdd(newPlane, false); // Add with non-persistent state initially
+
+            return newPlane;
+        }
     }
 
-    private Mesh CreatePlaneMesh(float width, float height)
+    private string GeneratePlaneIdentifier(Rect area, int textureWidth, int textureHeight)
     {
-        Mesh mesh = new Mesh { name = "GeneratedPlaneMesh" };
-        mesh.vertices = new Vector3[]
-        {
-            new Vector3(-width / 2, -height / 2, 0), new Vector3(width / 2, -height / 2, 0),
-            new Vector3(-width / 2, height / 2, 0), new Vector3(width / 2, height / 2, 0)
-        };
-        mesh.triangles = new int[] { 0, 2, 1, 2, 3, 1 };
-        mesh.uv = new Vector2[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(0, 1), new Vector2(1, 1) };
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
-        return mesh;
+        // Create a simple identifier based on the quantized center of the area
+        int qX = (int)((area.x + area.width / 2f) / textureWidth * 100);   // Quantize to 100 steps
+        int qY = (int)((area.y + area.height / 2f) / textureHeight * 100); // Quantize to 100 steps
+        return $"Area_{qX}_{qY}";
     }
+
+
+    private GameObject FindClosestExistingPlane(Vector3 position, string planeIdentifier)
+    {
+        GameObject closest = null;
+        float minDistance = float.MaxValue;
+
+        // First, check for a plane with the exact same identifier (meaning it's likely the same semantic area)
+        foreach (GameObject plane in generatedPlanes)
+        {
+            if (plane.name.Contains(planeIdentifier))
+            {
+                // If identifier matches, this is likely the one we want, even if slightly moved.
+                // We could add a distance check here too if identifiers can collide for different but close areas.
+                Log($"FindClosestExistingPlane: Found plane '{plane.name}' matching identifier '{planeIdentifier}'.", ARManagerDebugFlags.PlaneGeneration);
+                return plane;
+            }
+        }
+
+        // If no identifier match, fall back to simple distance (less reliable for semantic matching)
+        foreach (GameObject plane in generatedPlanes)
+        {
+            float distance = Vector3.Distance(plane.transform.position, position);
+            if (distance < minDistance)
+            {
+                minDistance = distance;
+                closest = plane;
+            }
+        }
+
+        if (closest != null && minDistance < planeMergeDistanceThreshold * 2) // Use a slightly larger threshold for this broader search
+        {
+            Log($"FindClosestExistingPlane: Found closest plane '{closest.name}' by distance ({minDistance:F2}m) for position {position.ToString("F3")}. No identifier match.", ARManagerDebugFlags.PlaneGeneration);
+            return closest;
+        }
+        // Log($"FindClosestExistingPlane: No suitable existing plane found for identifier '{planeIdentifier}' or position {position.ToString("F3")}.", ARManagerDebugFlags.PlaneGeneration);
+        return null;
+    }
+
 
     private void CleanupOldPlanes(Dictionary<GameObject, bool> visitedPlanesInCurrentMask)
     {
@@ -1150,34 +1209,46 @@ public class ARManagerInitializer2 : MonoBehaviour
         float currentTime = Time.time;
         float removalDelay = GetUnvisitedPlaneRemovalDelay();
 
-        for (int i = generatedPlanes.Count - 1; i >= 0; i--)
+        foreach (GameObject plane in generatedPlanes)
         {
-            GameObject plane = generatedPlanes[i];
-            if (plane == null)
-            {
-                generatedPlanes.RemoveAt(i);
-                continue;
-            }
+            if (plane == null) continue; // Already destroyed or invalid
 
-            bool visitedThisUpdate = visitedPlanesInCurrentMask?.ContainsKey(plane) ?? false;
+            bool isPersistent = IsPlanePersistent(plane);
+            if (isPersistent) continue; // Don't remove persistent planes automatically
 
-            if (!visitedThisUpdate)
+            if (!visitedPlanesInCurrentMask.ContainsKey(plane))
             {
-                if (currentTime - planeLastVisitedTime.GetValueOrDefault(plane, currentTime) > removalDelay)
+                // If not visited in current mask, check its last visited time
+                if (planeLastVisitedTime.TryGetValue(plane, out float lastVisit))
                 {
-                    planesToRemove.Add(plane);
+                    if (currentTime - lastVisit > removalDelay)
+                    {
+                        planesToRemove.Add(plane);
+                        Log($"Marking plane '{plane.name}' for removal (unvisited for {currentTime - lastVisit:F1}s > {removalDelay:F1}s).", ARManagerDebugFlags.PlaneGeneration);
+                    }
                 }
-            }
-            else
-            {
-                planeLastVisitedTime[plane] = currentTime;
+                else
+                {
+                    // If it was never in planeLastVisitedTime (e.g. created but immediately not seen by mask logic again)
+                    // and it's been around longer than the delay, also remove.
+                    if (planeCreationTimes.TryGetValue(plane, out float creationTime))
+                    {
+                        if (currentTime - creationTime > removalDelay * 2) // Stricter for planes that never got a "last visit"
+                        {
+                            planesToRemove.Add(plane);
+                            Log($"Marking plane '{plane.name}' for removal (created {currentTime - creationTime:F1}s ago, never confirmed visited by mask).", ARManagerDebugFlags.PlaneGeneration);
+                        }
+                    }
+                }
             }
         }
 
         foreach (GameObject plane in planesToRemove)
         {
-            Log($"Removing old/unvisited custom generated plane: {plane.name}", ARManagerDebugFlags.PlaneGeneration);
+            Log($"Destroying unvisited plane: {plane.name}", ARManagerDebugFlags.PlaneGeneration);
             generatedPlanes.Remove(plane);
+            allGeneratedPlanes.Remove(plane);
+            activePlanesForPainting.Remove(plane);
             planeCreationTimes.Remove(plane);
             planeLastVisitedTime.Remove(plane);
             persistentGeneratedPlanes.Remove(plane);
@@ -1185,34 +1256,37 @@ public class ARManagerInitializer2 : MonoBehaviour
         }
     }
 
-    private (GameObject, float, float) FindClosestExistingPlane(Vector3 position, Vector3 normal, float maxDistance, float maxAngleDegrees)
+
+    // Overload for more specific search if needed, e.g. matching normal
+    private (GameObject plane, float distance, float angleDifference) FindClosestExistingPlane(
+        Vector3 position, Vector3 normal, float maxDistance, float maxAngleDegrees)
     {
         GameObject closestPlane = null;
-        float minDistance = float.MaxValue;
-        float minAngle = float.MaxValue;
+        float minDistance = maxDistance;
+        float minAngleDiff = maxAngleDegrees;
 
-        foreach (GameObject plane in generatedPlanes)
+        foreach (var plane in generatedPlanes) // Or use allGeneratedPlanes for a broader search
         {
             if (plane == null) continue;
-            float distance = Vector3.Distance(plane.transform.position, position);
-            float angle = Vector3.Angle(plane.transform.forward, -normal);
 
-            if (distance < maxDistance && angle < maxAngleDegrees)
+            float dist = Vector3.Distance(plane.transform.position, position);
+            if (dist < minDistance)
             {
-                if (distance < minDistance)
+                float angleDiff = Vector3.Angle(plane.transform.up, normal); // Assuming plane's 'up' is its normal
+                if (angleDiff < minAngleDiff)
                 {
-                    minDistance = distance;
-                    minAngle = angle;
+                    minDistance = dist;
+                    minAngleDiff = angleDiff;
                     closestPlane = plane;
                 }
             }
         }
-        return (closestPlane, minDistance, minAngle);
+        return (closestPlane, minDistance, minAngleDiff);
     }
+
 
     public static string GetGameObjectPath(Transform transform)
     {
-        if (transform == null) return "null";
         string path = transform.name;
         while (transform.parent != null)
         {
@@ -1221,17 +1295,21 @@ public class ARManagerInitializer2 : MonoBehaviour
         }
         return path;
     }
-
     public static string LayerMaskToString(LayerMask layerMask)
     {
-        if (layerMask.value == 0) return "<Nothing>";
-        if (layerMask.value == -1) return "<Everything>";
-        string S = "";
+        var included = new List<string>();
         for (int i = 0; i < 32; i++)
+        {
             if ((layerMask.value & (1 << i)) != 0)
-                S += (S == "" ? "" : " | ") + LayerMask.LayerToName(i);
-        return S == "" ? "<Error: EmptyLayerNameForValue>" : S;
+            {
+                string layerName = LayerMask.LayerToName(i);
+                if (string.IsNullOrEmpty(layerName)) included.Add($"Layer{i}");
+                else included.Add(layerName);
+            }
+        }
+        return string.Join(", ", included);
     }
+
 
     public Material VerticalPlaneMaterial => verticalPlaneMaterial;
     public Material HorizontalPlaneMaterial => horizontalPlaneMaterial;
@@ -1239,53 +1317,53 @@ public class ARManagerInitializer2 : MonoBehaviour
 
     private void InitializePersistentPlanesSystem()
     {
-        if (usePersistentPlanes)
-        {
-            Log("Система сохранения плоскостей инициализирована.", ARManagerDebugFlags.System | ARManagerDebugFlags.Initialization);
-        }
+        // Could load saved persistent planes here if implementing save/load
+        Log("Persistent planes system initialized (currently in-memory only).", ARManagerDebugFlags.System);
     }
 
     public bool MakePlanePersistent(GameObject plane)
     {
-        if (!usePersistentPlanes || plane == null) return false;
-        if (!persistentGeneratedPlanes.ContainsKey(plane))
+        if (plane == null) return false;
+        if (persistentGeneratedPlanes.ContainsKey(plane))
         {
-            persistentGeneratedPlanes.Add(plane, true);
-            planeCreationTimes[plane] = Time.time;
-            planeLastVisitedTime[plane] = Time.time;
+            persistentGeneratedPlanes[plane] = true;
+            Log($"Made plane '{plane.name}' persistent.", ARManagerDebugFlags.System);
             if (highlightPersistentPlanes)
             {
-                var renderer = plane.GetComponent<Renderer>();
-                if (renderer != null)
-                {
-                    MaterialPropertyBlock props = new MaterialPropertyBlock();
-                    renderer.GetPropertyBlock(props);
-                    props.SetColor("_Color", persistentPlaneColor);
-                    renderer.SetPropertyBlock(props);
-                }
-                Log($"Плоскость {plane.name} сделана персистентной и подсвечена.", ARManagerDebugFlags.PlaneGeneration);
+                Renderer rend = plane.GetComponent<Renderer>();
+                if (rend != null) rend.material.color = persistentPlaneColor;
             }
-            else Log($"Плоскость {plane.name} сделана персистентной.", ARManagerDebugFlags.PlaneGeneration);
             return true;
         }
+        LogWarning($"Cannot make plane '{plane.name}' persistent. It's not in the tracked list.", ARManagerDebugFlags.System);
         return false;
     }
 
     public bool IsPlanePersistent(GameObject plane)
     {
-        if (!usePersistentPlanes || plane == null) return false;
-        return persistentGeneratedPlanes.ContainsKey(plane);
+        if (plane == null) return false;
+        return persistentGeneratedPlanes.TryGetValue(plane, out bool isPersistent) && isPersistent;
     }
 
     public bool RemovePlanePersistence(GameObject plane)
     {
-        if (!usePersistentPlanes || plane == null) return false;
-        if (persistentGeneratedPlanes.Remove(plane))
+        if (plane == null) return false;
+        if (persistentGeneratedPlanes.ContainsKey(plane))
         {
-            planeCreationTimes.Remove(plane);
-            planeLastVisitedTime.Remove(plane);
-            Log($"Персистентность удалена для плоскости {plane.name}.", ARManagerDebugFlags.PlaneGeneration);
-            return true;
+            persistentGeneratedPlanes[plane] = false;
+            Log($"Removed persistence from plane '{plane.name}'.", ARManagerDebugFlags.System);
+            // Revert material if needed (ARPlaneConfigurator should handle this based on its original material logic)
+            // ARPlaneConfigurator configurator = plane.GetComponent<ARPlaneConfigurator>();
+            // // if (configurator != null) configurator.ResetMaterial(); // Conceptual // Commented out due to CS1061
+            // else
+            // {
+            //     Renderer rend = plane.GetComponent<Renderer>(); // Fallback simple material reset
+            //     if (rend != null && paintedPlaneOriginalMaterials.TryGetValue(plane.GetComponent<ARPlane>(), out Material originalMat))
+            //     {
+            //         rend.material = originalMat;
+            //     }
+            // }
+            return true; // RESTORED THIS LINE
         }
         return false;
     }
@@ -1293,273 +1371,474 @@ public class ARManagerInitializer2 : MonoBehaviour
     private bool IsARFoundationPlane(GameObject planeGo)
     {
         if (planeGo == null) return false;
+        // Check if it's a direct ARPlane component
         if (planeGo.GetComponent<ARPlane>() != null)
         {
-            if (planeGo.transform.parent != null && xrOrigin != null && xrOrigin.TrackablesParent != null &&
-                planeGo.transform.parent == xrOrigin.TrackablesParent) return true;
+            // Check if its parent is the XROrigin's TrackablesParent or the stored trackables parent ID
+            if (planeGo.transform.parent != null && this.xrOrigin != null && this.xrOrigin.TrackablesParent != null &&
+                planeGo.transform.parent == this.xrOrigin.TrackablesParent) return true;
             if (planeGo.transform.parent != null && trackablesParentInstanceID_FromStart != 0 &&
                 planeGo.transform.parent.GetInstanceID() == trackablesParentInstanceID_FromStart) return true;
         }
         return false;
     }
 
-    public float GetUnvisitedPlaneRemovalDelay() => 1.5f;
+    public float GetUnvisitedPlaneRemovalDelay() => 5.0f; // Increased delay before removing planes
 
     private Material GetMaterialForPlane(Vector3 planeNormal)
     {
-        if (Vector3.Angle(planeNormal, Vector3.up) < maxFloorCeilingAngleDeviation || Vector3.Angle(planeNormal, Vector3.down) < maxFloorCeilingAngleDeviation)
-        {
-            return horizontalPlaneMaterial != null ? horizontalPlaneMaterial : (verticalPlaneMaterial != null ? verticalPlaneMaterial : null);
-        }
-        else if (IsSurfaceVertical(planeNormal))
-        {
-            return verticalPlaneMaterial != null ? verticalPlaneMaterial : (horizontalPlaneMaterial != null ? horizontalPlaneMaterial : null);
-        }
-        LogWarning($"Could not determine specific material for plane normal {planeNormal}. Defaulting to vertical.", ARManagerDebugFlags.PlaneGeneration);
-        return verticalPlaneMaterial != null ? verticalPlaneMaterial : horizontalPlaneMaterial;
+        // Simplified: Determine if vertical or horizontal based on normal
+        bool isVertical = IsSurfaceVertical(planeNormal);
+        return isVertical ? verticalPlaneMaterial : horizontalPlaneMaterial;
     }
-
     private Material GetMaterialForPlane(Vector3 planeNormal, PlaneAlignment alignment)
     {
-        if (alignment == PlaneAlignment.Vertical) return verticalPlaneMaterial;
-        else if (alignment.IsHorizontal()) return horizontalPlaneMaterial;
-        LogWarning($"Не удалось определить материал для плоскости с alignment={alignment} и нормалью={planeNormal}. Используется вертикальный по умолчанию.", ARManagerDebugFlags.PlaneGeneration);
-        return verticalPlaneMaterial != null ? verticalPlaneMaterial : horizontalPlaneMaterial;
+        switch (alignment)
+        {
+            case PlaneAlignment.Vertical:
+                return verticalPlaneMaterial;
+            case PlaneAlignment.HorizontalUp:
+            case PlaneAlignment.HorizontalDown:
+                return horizontalPlaneMaterial;
+            default: // NonAligned or other cases
+                return verticalPlaneMaterial; // Default or handle as needed
+        }
     }
+
 
     private void HandlePlaneSelectionByTap()
     {
-        if (Input.touchCount > 0 && Input.GetTouch(0).phase == TouchPhase.Began)
+        bool tapped = false;
+        Vector2 tapPosition = Vector2.zero;
+
+        if (Touchscreen.current != null && Touchscreen.current.primaryTouch.isInProgress)
         {
-            if (arRaycastManager == null)
+            if (Touchscreen.current.primaryTouch.phase.ReadValue() == UnityEngine.InputSystem.TouchPhase.Began)
             {
-                LogWarning("ARRaycastManager is not available, cannot select planes by tap.", ARManagerDebugFlags.Raycasting);
-                return;
+                tapped = true;
+                tapPosition = Touchscreen.current.primaryTouch.position.ReadValue();
             }
+        }
+        else if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame) // Also allow mouse input for editor testing
+        {
+            tapped = true;
+            tapPosition = Mouse.current.position.ReadValue();
+        }
 
-            Color paintColorToApply = Color.white;
-            if (colorManager != null) paintColorToApply = colorManager.GetCurrentColor();
-
-            List<ARRaycastHit> hits = new List<ARRaycastHit>();
-            if (arRaycastManager.Raycast(Input.GetTouch(0).position, hits, TrackableType.PlaneWithinPolygon | TrackableType.PlaneWithinBounds))
-            {
-                ARRaycastHit hit = hits[0];
-                ARPlane hitPlane = planeManager?.GetPlane(hit.trackableId);
-
-                if (hitPlane != null)
-                {
-                    Log($"Tapped on ARFoundation plane: {hitPlane.trackableId}, Alignment: {hitPlane.alignment}", ARManagerDebugFlags.Raycasting);
-                    if (paintMaterial != null)
-                    {
-                        MeshRenderer hitPlaneRenderer = hitPlane.GetComponent<MeshRenderer>();
-                        if (hitPlaneRenderer != null)
-                        {
-                            if (!paintedPlaneOriginalMaterials.ContainsKey(hitPlane))
-                            {
-                                paintedPlaneOriginalMaterials[hitPlane] = hitPlaneRenderer.sharedMaterial;
-                            }
-                            Material materialInstance = Instantiate(paintMaterial);
-                            hitPlaneRenderer.material = materialInstance;
-                            materialInstance.SetColor("_PaintColor", paintColorToApply);
-                            Log($"Applied paint color {paintColorToApply} to ARFoundation plane {hitPlane.trackableId}", ARManagerDebugFlags.PlaneGeneration);
-                            if (wallSegmentation?.segmentationMaskTexture != null)
-                            {
-                                materialInstance.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
-                            }
-                            else
-                            {
-                                materialInstance.SetTexture("_SegmentationMask", null);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    Ray ray = arCameraManager.GetComponent<Camera>().ScreenPointToRay(Input.GetTouch(0).position);
-                    RaycastHit physicsHit;
-                    if (Physics.Raycast(ray, out physicsHit, maxRayDistance, hitLayerMask))
-                    {
-                        if (generatedPlanes.Contains(physicsHit.collider.gameObject))
-                        {
-                            GameObject hitGeneratedPlane = physicsHit.collider.gameObject;
-                            Log($"Tapped on generated plane: {hitGeneratedPlane.name}", ARManagerDebugFlags.Raycasting);
-                            if (paintMaterial != null)
-                            {
-                                MeshRenderer hitRenderer = hitGeneratedPlane.GetComponent<MeshRenderer>();
-                                if (hitRenderer != null)
-                                {
-                                    Material materialInstance = Instantiate(paintMaterial);
-                                    hitRenderer.material = materialInstance;
-                                    materialInstance.SetColor("_PaintColor", paintColorToApply);
-                                    Log($"Applied paint color {paintColorToApply} to generated plane {hitGeneratedPlane.name}", ARManagerDebugFlags.PlaneGeneration);
-                                    if (wallSegmentation?.segmentationMaskTexture != null)
-                                    {
-                                        materialInstance.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
-                                    }
-                                    else
-                                    {
-                                        materialInstance.SetTexture("_SegmentationMask", null);
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            Log($"Tap hit an object ({physicsHit.collider.name}) on a valid layer via Physics.Raycast, but it's not a recognized ARPlane or generated plane.", ARManagerDebugFlags.Raycasting);
-                        }
-                    }
-                    else
-                    {
-                        Log("Tap did not hit any ARPlane trackable via ARRaycastManager nor any physics object on hitLayerMask.", ARManagerDebugFlags.Raycasting);
-                    }
-                }
-            }
-            else
-            {
-                Ray ray = arCameraManager.GetComponent<Camera>().ScreenPointToRay(Input.GetTouch(0).position);
-                RaycastHit physicsHit;
-                if (Physics.Raycast(ray, out physicsHit, maxRayDistance, hitLayerMask))
-                {
-                    if (generatedPlanes.Contains(physicsHit.collider.gameObject))
-                    {
-                        GameObject hitGeneratedPlane = physicsHit.collider.gameObject;
-                        Log($"Tapped on generated plane (fallback Physics.Raycast): {hitGeneratedPlane.name}", ARManagerDebugFlags.Raycasting);
-                        if (paintMaterial != null)
-                        {
-                            MeshRenderer hitRenderer = hitGeneratedPlane.GetComponent<MeshRenderer>();
-                            if (hitRenderer != null)
-                            {
-                                Material materialInstance = Instantiate(paintMaterial);
-                                hitRenderer.material = materialInstance;
-                                materialInstance.SetColor("_PaintColor", paintColorToApply);
-                                Log($"Applied paint color {paintColorToApply} to generated plane {hitGeneratedPlane.name}", ARManagerDebugFlags.PlaneGeneration);
-                                if (wallSegmentation?.segmentationMaskTexture != null)
-                                {
-                                    materialInstance.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
-                                }
-                                else
-                                {
-                                    materialInstance.SetTexture("_SegmentationMask", null);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        Log($"Tap (fallback Physics.Raycast) hit an object ({physicsHit.collider.name}) on a valid layer, but it's not a recognized generated plane.", ARManagerDebugFlags.Raycasting);
-                    }
-                }
-                else
-                {
-                    Log("Tap did not hit any ARPlane trackable via ARRaycastManager nor any physics object on hitLayerMask (fallback).", ARManagerDebugFlags.Raycasting);
-                }
-            }
+        if (tapped)
+        {
+            HandleTap(tapPosition);
         }
     }
 
     private void HandleTap(Vector2 touchPosition)
     {
-        Log($"[LEGACY TAP] HandleTap called with touchPosition: {touchPosition}. This method might be deprecated by HandlePlaneSelectionByTap.", ARManagerDebugFlags.Raycasting, ARManagerLogLevel.Warning);
-        if (paintMaterial == null)
+        if (wallPaintMaterial == null || colorManager == null)
         {
-            LogWarning("paintMaterial не назначен в ARManagerInitializer2. Покраска невозможна.", ARManagerDebugFlags.Raycasting);
-            return;
-        }
-        if (arRaycastManager == null)
-        {
-            LogError("arRaycastManager не назначен в ARManagerInitializer2. Рейкастинг невозможен.", ARManagerDebugFlags.Raycasting);
+            LogWarning("WallPaintMaterial or ARWallPaintColorManager not set. Cannot paint.", ARManagerDebugFlags.System);
             return;
         }
 
-        List<ARRaycastHit> hits = new List<ARRaycastHit>();
-        if (arRaycastManager.Raycast(touchPosition, hits, TrackableType.PlaneWithinPolygon))
+        Log($"HandleTap: Processing tap at screen position {touchPosition}", ARManagerDebugFlags.Raycasting);
+        List<ARRaycastHit> arHits = new List<ARRaycastHit>();
+        ARRaycastHit arHit = default;
+        bool didArHit = false;
+
+        if (arRaycastManager != null && useDetectedPlanesForTap)
         {
-            if (hits.Count > 0)
+            if (arRaycastManager.Raycast(touchPosition, arHits, trackableTypesToHit))
             {
-                ARRaycastHit hit = hits[0];
-                ARPlane tappedPlane = hit.trackable as ARPlane;
-                if (tappedPlane != null)
-                {
-                    Log($"[LEGACY TAP] Коснулись плоскости: {tappedPlane.trackableId}, Alignment: {tappedPlane.alignment}, Distance: {hit.distance}", ARManagerDebugFlags.Raycasting);
-                    if (tappedPlane.alignment == PlaneAlignment.Vertical)
-                    {
-                        if (colorManager != null) PaintPlane(tappedPlane, colorManager.currentColor);
-                        else PaintPlane(tappedPlane, Color.magenta);
-                    }
-                    else Log($"[LEGACY TAP] Плоскость {tappedPlane.trackableId} не вертикальная (Alignment: {tappedPlane.alignment}), покраска отменена.", ARManagerDebugFlags.Raycasting);
-                }
-                else LogWarning($"[LEGACY TAP] Рейкаст попал в объект типа {(hit.trackable != null ? hit.trackable.GetType().Name : "null")}, но это не ARPlane.", ARManagerDebugFlags.Raycasting);
+                arHit = arHits[0]; // Use the closest AR hit
+                didArHit = true;
+                Log($"AR Raycast hit trackable {arHit.trackableId} of type {arHit.hitType} at distance {arHit.distance:F2}", ARManagerDebugFlags.Raycasting);
             }
-            else LogWarning("[LEGACY TAP] Рейкаст вернул true, но список попаданий пуст.", ARManagerDebugFlags.Raycasting);
-        }
-        else Log("[LEGACY TAP] Рейкаст не попал ни в одну AR плоскость (TrackableType.PlaneWithinPolygon).", ARManagerDebugFlags.Raycasting);
-    }
-
-    private void PaintPlane(ARPlane plane, Color color)
-    {
-        Log($"[PaintPlane - Legacy Flow] Attempting to paint plane {plane.trackableId} with color {color}", ARManagerDebugFlags.PlaneGeneration);
-        MeshRenderer renderer = plane.GetComponent<MeshRenderer>();
-        if (renderer == null)
-        {
-            LogError($"[PaintPlane] MeshRenderer not found on plane {plane.trackableId}", ARManagerDebugFlags.PlaneGeneration);
-            return;
-        }
-        if (paintMaterial == null)
-        {
-            LogError("[PaintPlane] paintMaterial is null. Cannot paint.", ARManagerDebugFlags.PlaneGeneration);
-            return;
         }
 
-        if (!paintedPlaneOriginalMaterials.ContainsKey(plane))
+        RaycastHit physicsHit = default;
+        bool didPhysicsHit = false;
+        Camera cam = (this.xrOrigin != null && this.xrOrigin.Camera != null) ? this.xrOrigin.Camera : Camera.main;
+        if (cam == null)
         {
-            paintedPlaneOriginalMaterials[plane] = renderer.sharedMaterial;
+            LogError("No camera found for raycasting in HandleTap.");
+            return;
         }
-        Material instancedPaintMaterial = Instantiate(paintMaterial);
-        instancedPaintMaterial.SetColor("_PaintColor", color);
-        if (wallSegmentation != null && wallSegmentation.segmentationMaskTexture != null)
+        Ray ray = cam.ScreenPointToRay(touchPosition);
+
+        if (usePhysicsRaycastForTap)
         {
-            instancedPaintMaterial.SetTexture("_SegmentationMask", wallSegmentation.segmentationMaskTexture);
+            // We want to hit our custom planes (on planeLayerName) AND the simulated environment
+            LayerMask tapMask = hitLayerMask; // Start with the general mask (which includes simulated env)
+            int customPlaneLayerVal = LayerMask.NameToLayer(planeLayerName);
+            if (customPlaneLayerVal != -1) tapMask |= (1 << customPlaneLayerVal); // Add custom plane layer to tap mask
+
+            Log($"Tap Physics Raycast LayerMask: {LayerMaskToString(tapMask)} (Raw: {tapMask.value})", ARManagerDebugFlags.Raycasting | ARManagerDebugFlags.DetailedRaycastLogging);
+
+
+            if (Physics.Raycast(ray, out physicsHit, maxRayDistance, tapMask))
+            {
+                if (IsIgnoredObject(physicsHit.collider.gameObject))
+                {
+                    Log($"Tap Physics Raycast hit IGNORED object: {physicsHit.collider.name}", ARManagerDebugFlags.Raycasting);
+                }
+                else
+                {
+                    didPhysicsHit = true;
+                    Log($"Physics Raycast hit {physicsHit.collider.name} on layer {LayerMask.LayerToName(physicsHit.collider.gameObject.layer)} at distance {physicsHit.distance:F2}", ARManagerDebugFlags.Raycasting);
+                }
+            }
+        }
+
+        if ((this.debugFlags & ARManagerDebugFlags.Raycasting) != 0 && drawDebugRays)
+        {
+            Color rayColor = (didPhysicsHit || didArHit) ? Color.magenta : Color.yellow;
+            DrawDebugRay(ray, rayColor, 3.0f);
+        }
+
+
+        // Priority:
+        // 1. Physics hit on one of our custom ARPaintPlane objects.
+        // 2. ARFoundation plane hit (if useDetectedPlanesForTap is true).
+        // 3. Physics hit on simulated environment.
+
+        GameObject planeToPaintGO = null;
+
+        if (didPhysicsHit)
+        {
+            // Check if the physics hit is one of our generated ARPaintPlanes
+            ARPlaneConfigurator configurator = physicsHit.collider.GetComponentInParent<ARPlaneConfigurator>();
+            if (configurator != null && generatedPlanes.Contains(configurator.gameObject))
+            {
+                planeToPaintGO = configurator.gameObject;
+                Log($"Selected ARPaintPlane '{planeToPaintGO.name}' via Physics Raycast for painting.", ARManagerDebugFlags.System);
+            }
+            else if (LayerMask.LayerToName(physicsHit.collider.gameObject.layer) == basicSceneGeometryLayerName)
+            {
+                // If we hit the simulated environment, AND no AR plane was closer or prioritized
+                if (!didArHit || (didArHit && physicsHit.distance < arHit.distance))
+                {
+                    Log($"Physics raycast hit simulated environment '{physicsHit.collider.name}'. This could be a paint target if no AR plane is better.", ARManagerDebugFlags.System);
+                    // Here, you might want to create a temporary ARPaintPlane on the simulated surface or directly apply a decal.
+                    // For now, let's assume we prioritize actual AR planes or our custom planes.
+                    // If you want to paint on simulated env, this is where you'd handle it.
+                    // planeToPaintGO = physicsHit.collider.gameObject; // Or a temporary plane
+                }
+            }
+        }
+
+        if (planeToPaintGO == null && didArHit) // If no custom plane hit via physics, check AR hit
+        {
+            ARPlane arPlane = planeManager?.GetPlane(arHit.trackableId);
+            if (arPlane != null)
+            {
+                // Check if this ARPlane already has a corresponding ARPaintPlane managed by us
+                GameObject correspondingPaintPlane = FindClosestExistingPlane(arPlane.transform.position, arPlane.trackableId.ToString());
+                if (correspondingPaintPlane != null && generatedPlanes.Contains(correspondingPaintPlane) &&
+                    (correspondingPaintPlane.transform.position - arPlane.transform.position).sqrMagnitude < 0.1f) // Ensure it's very close
+                {
+                    planeToPaintGO = correspondingPaintPlane;
+                    Log($"Selected existing ARPaintPlane '{planeToPaintGO.name}' corresponding to ARFoundation plane '{arPlane.trackableId}' for painting.", ARManagerDebugFlags.System);
+                }
+                else
+                {
+                    // If we want to paint directly on ARFoundation planes or create a custom one for it:
+                    // planeToPaintGO = arPlane.gameObject; // This would select the ARFoundation plane itself
+                    Log($"ARFoundation plane '{arPlane.trackableId}' hit. Consider creating/finding a custom paint plane for it if not painting directly.", ARManagerDebugFlags.System);
+                }
+            }
+        }
+
+
+        if (planeToPaintGO != null)
+        {
+            Renderer rend = planeToPaintGO.GetComponent<Renderer>();
+            if (rend != null)
+            {
+                Material[] materials = rend.materials; // Get a copy
+                if (materials.Length > 0)
+                {
+                    // Assuming the first material is the one to paint
+                    Material originalMaterial = materials[0]; // Store original if not already
+
+                    // Create an instance of the wallPaintMaterial to avoid modifying the asset
+                    Material paintInstance = new Material(wallPaintMaterial);
+                    paintInstance.color = colorManager.GetCurrentColor(); // Set the paint color
+                    if (currentSegmentationMask != null)
+                    {
+                        paintInstance.SetTexture("_SegmentationMask", currentSegmentationMask);
+                        // Potentially set UVs or other mask parameters if needed by shader
+                    }
+                    materials[0] = paintInstance;
+                    rend.materials = materials; // Assign the new array with the instanced material
+
+                    Log($"Applied paint material (color: {colorManager.GetCurrentColor()}) to {planeToPaintGO.name}", ARManagerDebugFlags.System);
+
+                    // Store original material if we want to revert later (more complex for multiple paints)
+                    // if (!paintedPlaneOriginalMaterials.ContainsKey(planeToPaintGO.GetComponent<ARPlane>())) // Needs ARPlane component if keying by it
+                    // {
+                    //    paintedPlaneOriginalMaterials[planeToPaintGO.GetComponent<ARPlane>()] = originalMaterial;
+                    // }
+                }
+            }
         }
         else
         {
-            instancedPaintMaterial.SetTexture("_SegmentationMask", null);
-            LogWarning("[PaintPlane] wallSegmentation or its mask is null. Painting without mask.", ARManagerDebugFlags.PlaneGeneration);
+            Log("No suitable plane selected by tap for painting.", ARManagerDebugFlags.System);
         }
-        renderer.material = instancedPaintMaterial;
-        Log($"[PaintPlane] Applied paint material with color {color} to plane {plane.trackableId}", ARManagerDebugFlags.PlaneGeneration);
     }
 
-    // NEW METHOD TO SAVE LOW RESOLUTION MASK
-    private void SaveLowResMaskForDebug(RenderTexture rt, string fileName)
+
+    private void DrawDebugRay(Ray ray, Color color, float duration)
     {
-        if (rt == null)
+        if ((this.debugFlags & ARManagerDebugFlags.Raycasting) != 0 && enableDetailedRaycastLogging) // ensure detailed logging is on for rays
         {
-            LogWarning($"SaveLowResMaskForDebug: RenderTexture is null, cannot save {fileName}. (Direct Log)");
+            Debug.DrawRay(ray.origin, ray.direction * maxRayDistance, color, duration);
+        }
+    }
+
+    private void CreateBasicSceneGeometry()
+    {
+        if (GameObject.Find("SimulatedRoom_Floor") != null)
+        {
+            Log("Basic scene geometry already exists. Skipping creation.", ARManagerDebugFlags.Initialization);
+            return;
+        }
+        Log("Creating basic scene geometry for simulation.", ARManagerDebugFlags.Initialization);
+
+        int simulatedLayer = LayerMask.NameToLayer(basicSceneGeometryLayerName);
+        if (simulatedLayer == -1)
+        {
+            LogError($"Layer '{basicSceneGeometryLayerName}' not found. Cannot create basic scene geometry correctly. Please add the layer.", ARManagerDebugFlags.Initialization);
             return;
         }
 
-        RenderTexture prevActive = RenderTexture.active;
-        RenderTexture.active = rt;
-        Texture2D tempTex = new Texture2D(rt.width, rt.height, TextureFormat.R8, false); // Assuming R8 format for single channel
-        tempTex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-        tempTex.Apply();
-        RenderTexture.active = prevActive;
+        // Floor
+        GameObject floor = GameObject.CreatePrimitive(PrimitiveType.Plane);
+        floor.name = "SimulatedRoom_Floor";
+        floor.transform.localScale = new Vector3(basicSceneRoomSize.x / 10f, 1, basicSceneRoomSize.z / 10f); // Plane primitive is 10x10 units
+        floor.transform.position = new Vector3(0, -basicSceneRoomSize.y / 2f, 0); // Centered at origin, y is bottom
+        floor.layer = simulatedLayer;
+        Renderer floorRend = floor.GetComponent<Renderer>();
+        if (floorRend) floorRend.material.color = new Color(0.8f, 0.8f, 0.8f);
 
-        byte[] bytes = tempTex.EncodeToPNG();
-        Destroy(tempTex);
 
-        string directoryPath = Path.Combine(Application.persistentDataPath, "DebugSegmentationOutputs");
-        Directory.CreateDirectory(directoryPath); // Ensures the directory exists
-        string filePath = Path.Combine(directoryPath, fileName);
+        // Walls (simple cubes)
+        Vector3 wallSizeX = new Vector3(basicSceneRoomSize.x, basicSceneRoomSize.y, basicSceneWallThickness);
+        Vector3 wallSizeZ = new Vector3(basicSceneWallThickness, basicSceneRoomSize.y, basicSceneRoomSize.z + (2 * basicSceneWallThickness)); // Extend Z walls to cover corners
 
-        try
+        // Wall -Z
+        GameObject wall_NZ = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        wall_NZ.name = "SimulatedRoom_Wall_NZ";
+        wall_NZ.transform.localScale = wallSizeX;
+        wall_NZ.transform.position = new Vector3(0, 0, -basicSceneRoomSize.z / 2f - basicSceneWallThickness / 2f);
+        wall_NZ.layer = simulatedLayer;
+        wall_NZ.GetComponent<Renderer>().material.color = new Color(0.7f, 0.7f, 0.7f);
+
+
+        // Wall +Z
+        GameObject wall_PZ = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        wall_PZ.name = "SimulatedRoom_Wall_PZ";
+        wall_PZ.transform.localScale = wallSizeX;
+        wall_PZ.transform.position = new Vector3(0, 0, basicSceneRoomSize.z / 2f + basicSceneWallThickness / 2f);
+        wall_PZ.layer = simulatedLayer;
+        wall_PZ.GetComponent<Renderer>().material.color = new Color(0.7f, 0.7f, 0.7f);
+
+        // Wall -X
+        GameObject wall_NX = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        wall_NX.name = "SimulatedRoom_Wall_NX";
+        wall_NX.transform.localScale = wallSizeZ;
+        wall_NX.transform.position = new Vector3(-basicSceneRoomSize.x / 2f - basicSceneWallThickness / 2f, 0, 0);
+        wall_NX.layer = simulatedLayer;
+        wall_NX.GetComponent<Renderer>().material.color = new Color(0.75f, 0.75f, 0.75f);
+
+        // Wall +X
+        GameObject wall_PX = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        wall_PX.name = "SimulatedRoom_Wall_PX";
+        wall_PX.transform.localScale = wallSizeZ;
+        wall_PX.transform.position = new Vector3(basicSceneRoomSize.x / 2f + basicSceneWallThickness / 2f, 0, 0);
+        wall_PX.layer = simulatedLayer;
+        wall_PX.GetComponent<Renderer>().material.color = new Color(0.75f, 0.75f, 0.75f);
+
+        // Parent them for organization if desired
+        GameObject roomParent = new GameObject("SimulatedRoom");
+        floor.transform.SetParent(roomParent.transform);
+        wall_NZ.transform.SetParent(roomParent.transform);
+        wall_PZ.transform.SetParent(roomParent.transform);
+        wall_NX.transform.SetParent(roomParent.transform);
+        wall_PX.transform.SetParent(roomParent.transform);
+
+        // Optional: Add a ceiling
+        GameObject ceiling = GameObject.CreatePrimitive(PrimitiveType.Plane);
+        ceiling.name = "SimulatedRoom_Ceiling";
+        ceiling.transform.localScale = new Vector3(basicSceneRoomSize.x / 10f, 1, basicSceneRoomSize.z / 10f);
+        ceiling.transform.position = new Vector3(0, basicSceneRoomSize.y / 2f, 0);
+        ceiling.transform.rotation = Quaternion.Euler(180, 0, 0); // Flip to face down
+        ceiling.layer = simulatedLayer;
+        Renderer ceilRend = ceiling.GetComponent<Renderer>();
+        if (ceilRend) ceilRend.material.color = new Color(0.8f, 0.8f, 0.8f);
+        ceiling.transform.SetParent(roomParent.transform);
+
+
+        Log("Basic scene geometry created.", ARManagerDebugFlags.Initialization);
+    }
+
+    private bool IsIgnoredObject(GameObject obj)
+    {
+        if (obj == null) return false;
+
+        // Rule 1: Check against the string array of names
+        if (ignoredObjectNamesArray.Length > 0)
         {
-            File.WriteAllBytes(filePath, bytes);
-            Log($"SaveLowResMaskForDebug: Successfully saved {fileName} to {directoryPath} (Direct Log)");
+            if (ignoredObjectNamesArray.Contains(obj.name))
+            {
+                // Log($"IsIgnoredObject: '{obj.name}' IGNORED: exact name match.", ARManagerDebugFlags.Raycasting);
+                return true;
+            }
+            // Check if obj.name starts with any of the ignored names (e.g., "ARPaintPlane_")
+            foreach (string ignoredPrefix in ignoredObjectNamesArray)
+            {
+                if (!string.IsNullOrEmpty(ignoredPrefix) && obj.name.StartsWith(ignoredPrefix))
+                {
+                    // Log($"IsIgnoredObject: '{obj.name}' IGNORED: prefix match with '{ignoredPrefix}'.", ARManagerDebugFlags.Raycasting);
+                    return true;
+                }
+            }
         }
-        catch (System.Exception e)
+
+        // Rule 2: This ARManagerInitializer2 GameObject itself
+        if (obj == this.gameObject)
         {
-            LogError($"SaveLowResMaskForDebug: Failed to save {fileName}. Error: {e.Message} (Direct Log)");
+            // Log($"IsIgnoredObject: '{obj.name}' IGNORED: self.", ARManagerDebugFlags.Raycasting);
+            return true;
         }
+
+        // Rule 3: The Main Camera if it's the AR Camera
+        if (arCameraManager != null && obj == arCameraManager.gameObject)
+        {
+            // Log($"IsIgnoredObject: '{obj.name}' IGNORED: AR Camera object.", ARManagerDebugFlags.Raycasting);
+            return true;
+        }
+        Camera mainCam = Camera.main;
+        if (mainCam != null && obj == mainCam.gameObject)
+        {
+            // Log($"IsIgnoredObject: '{obj.name}' IGNORED: Main Camera object.", ARManagerDebugFlags.Raycasting);
+            return true;
+        }
+
+
+        // Rule 4: Objects on "UI" layer
+        if (obj.layer == LayerMask.NameToLayer("UI"))
+        {
+            // Log($"IsIgnoredObject: '{obj.name}' IGNORED: UI layer.", ARManagerDebugFlags.Raycasting);
+            return true;
+        }
+
+        // Rule 5: The XROrigin itself (but not its children like TrackablesParent necessarily, unless specified in ignoredObjectNames)
+        if (this.xrOrigin != null && obj == this.xrOrigin.gameObject)
+        {
+            // Log($"IsIgnoredObject: '{obj.name}' IGNORED: XROrigin root object.", ARManagerDebugFlags.Raycasting);
+            return true;
+        }
+
+        // Rule 6: Children of XROrigin (that are not the camera itself and not part of the trackables if we want to hit those)
+        // This rule might be too broad or too specific depending on the XROrigin setup.
+        // For instance, if TrackablesParent is a child of XROrigin, we might NOT want to ignore it if it contains ARPlanes we want to hit.
+        // This is why explicit layer checks or specific name checks are often better.
+        // Let's refine this: ignore direct children of XROrigin if they are not the camera and not the trackables parent.
+        if (this.xrOrigin != null && obj.transform.IsChildOf(this.xrOrigin.transform) &&
+            obj != this.xrOrigin.gameObject &&
+            (arCameraManager == null || obj != arCameraManager.gameObject) &&
+            (this.xrOrigin.TrackablesParent == null || obj != this.xrOrigin.TrackablesParent.gameObject))
+        {
+            Log($"IsIgnoredObject: '{obj.name}' IGNORED: direct child of XROrigin (not camera/trackables parent).", ARManagerDebugFlags.Raycasting);
+            return true;
+        }
+
+
+        return false;
+    }
+
+
+    private void OnPlanesChanged(ARPlanesChangedEventArgs args)
+    {
+        if ((this.debugFlags & ARManagerDebugFlags.ARSystem) != 0)
+        {
+            if (args.added.Count > 0) Log($"ARPlaneManager.PlanesChanged: {args.added.Count} plane(s) added.", ARManagerDebugFlags.ARSystem);
+            if (args.updated.Count > 0) Log($"ARPlaneManager.PlanesChanged: {args.updated.Count} plane(s) updated.", ARManagerDebugFlags.ARSystem);
+            if (args.removed.Count > 0) Log($"ARPlaneManager.PlanesChanged: {args.removed.Count} plane(s) removed.", ARManagerDebugFlags.ARSystem);
+        }
+
+        foreach (ARPlane plane in args.added) OnPlaneAdded(plane);
+        foreach (ARPlane plane in args.updated) OnPlaneUpdated(plane);
+        foreach (ARPlane plane in args.removed) OnPlaneRemoved(plane);
+    }
+
+    private void OnPlaneAdded(ARPlane plane)
+    {
+        Log($"ARPlane Added: {plane.trackableId}, Alignment: {plane.alignment}, Center: {plane.center.ToString("F3")}", ARManagerDebugFlags.ARSystem);
+        if (!allGeneratedPlanes.Contains(plane.gameObject)) allGeneratedPlanes.Add(plane.gameObject);
+        // Optionally configure ARFoundation planes if not creating custom ones
+        // Example: plane.GetComponent<Renderer>().material = GetMaterialForPlane(plane.normal, plane.alignment);
+    }
+
+    private void OnPlaneUpdated(ARPlane plane)
+    {
+        // Log($"ARPlane Updated: {plane.trackableId}, Alignment: {plane.alignment}, Center: {plane.center.ToString("F3")}", ARManagerDebugFlags.ARSystem);
+        // If managing materials on ARFoundation planes directly, update here
+    }
+
+    private void OnPlaneRemoved(ARPlane plane)
+    {
+        Log($"ARPlane Removed: {plane.trackableId}", ARManagerDebugFlags.ARSystem);
+        allGeneratedPlanes.Remove(plane.gameObject);
+        // If this ARPlane had a corresponding custom plane, it might also need cleanup if not handled by mask logic
+    }
+
+
+    private bool IsSurfaceVertical(Vector3 normal)
+    {
+        float angleWithUp = Vector3.Angle(normal, Vector3.up);
+        // A surface is vertical if its normal is (close to) perpendicular to the world up vector.
+        // So, the angle between the normal and world up should be close to 90 degrees.
+        // maxWallNormalAngleDeviation is how much it can deviate from being perfectly 90 degrees to world up.
+        bool isVertical = Mathf.Abs(angleWithUp - 90f) <= maxWallNormalAngleDeviation;
+        if ((this.debugFlags & ARManagerDebugFlags.Raycasting) != 0) // Conditional log
+        {
+            Log($"[IsSurfaceVertical] Normal: {normal.ToString("F3")}, AngleWithUp: {angleWithUp:F1}°, IsVertical: {isVertical} (maxWallNormalAngleDeviation: {maxWallNormalAngleDeviation}°)", ARManagerDebugFlags.Raycasting);
+        }
+        return isVertical;
+    }
+
+
+    private Mesh CreatePlaneMesh(float width, float height)
+    {
+        Mesh mesh = new Mesh();
+        mesh.name = "CustomARPlaneMesh";
+
+        Vector3[] vertices = new Vector3[4]
+        {
+            new Vector3(-width / 2f, -height / 2f, 0),
+            new Vector3(width / 2f, -height / 2f, 0),
+            new Vector3(-width / 2f, height / 2f, 0),
+            new Vector3(width / 2f, height / 2f, 0)
+        };
+        mesh.vertices = vertices;
+
+        int[] tris = new int[6] { 0, 2, 1, 2, 3, 1 }; // Standard quad triangulation
+        mesh.triangles = tris;
+
+        Vector3[] normals = new Vector3[4]
+        {
+            -Vector3.forward, -Vector3.forward, -Vector3.forward, -Vector3.forward
+        };
+        mesh.normals = normals; // Assuming plane faces -Z locally
+
+        Vector2[] uv = new Vector2[4]
+        {
+            new Vector2(0, 0), new Vector2(1, 0), new Vector2(0, 1), new Vector2(1, 1)
+        };
+        mesh.uv = uv;
+
+        mesh.RecalculateBounds();
+        return mesh;
     }
 }

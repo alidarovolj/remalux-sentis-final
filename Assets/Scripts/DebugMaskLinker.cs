@@ -15,12 +15,18 @@ public class DebugMaskLinker : MonoBehaviour
     [Tooltip("Assign the SegMaskDisplayMaterial here.")]
     public Material customMaskDisplayMaterial;
 
+    [Header("Logging Control")]
+    [Tooltip("Enable all logging messages from this DebugMaskLinker component.")]
+    public bool enableComponentLogging = true;
+
     void Start()
     {
+        if (enableComponentLogging) Debug.Log("DebugMaskLinker Start called", this);
+
         rawImage = GetComponent<RawImage>();
         if (rawImage == null)
         {
-            Debug.LogError("[DebugMaskLinker] RawImage компонент не найден на этом GameObject.", gameObject);
+            if (enableComponentLogging) Debug.LogError("[DebugMaskLinker] RawImage компонент не найден на этом GameObject.", this);
             enabled = false; // Отключаем скрипт, если нет RawImage
             return;
         }
@@ -29,11 +35,11 @@ public class DebugMaskLinker : MonoBehaviour
         if (customMaskDisplayMaterial != null)
         {
             rawImage.material = Instantiate(customMaskDisplayMaterial); // Use Instantiate to avoid shared material issues if multiple RawImages use this
-            Debug.Log($"[DebugMaskLinker] Назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", gameObject);
+            if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", this);
         }
         else
         {
-            Debug.LogWarning("[DebugMaskLinker] customMaskDisplayMaterial не назначен. RawImage будет использовать свой текущий или стандартный материал.", gameObject);
+            if (enableComponentLogging) Debug.LogWarning("[DebugMaskLinker] customMaskDisplayMaterial не назначен. RawImage будет использовать свой текущий или стандартный материал.", this);
             // Fallback to old logic if custom material is not set, or simply do nothing and let it use its default.
             // For simplicity, we'll let it use its default or whatever was set before if customMaskDisplayMaterial is null.
             // The old logic for unlitDisplayMaterial can be removed or kept as a secondary fallback.
@@ -70,29 +76,54 @@ public class DebugMaskLinker : MonoBehaviour
         if (rawImage.raycastTarget)
         {
             rawImage.raycastTarget = false;
-            Debug.Log("[DebugMaskLinker] Raycast Target отключен для предотвращения блокировки AR-взаимодействия.", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] Raycast Target отключен для предотвращения блокировки AR-взаимодействия.", this);
         }
 
         wallSegmentation = FindObjectOfType<WallSegmentation>();
         if (wallSegmentation == null)
         {
-            Debug.LogError("[DebugMaskLinker] WallSegmentation компонент не найден в сцене.", gameObject);
+            if (enableComponentLogging) Debug.LogError("[DebugMaskLinker] WallSegmentation компонент не найден в сцене.", this);
             enabled = false;
             return;
         }
 
+        if (enableComponentLogging) Debug.Log("Attempting to subscribe to WallSegmentation events.", this);
         wallSegmentation.OnSegmentationMaskUpdated += UpdateMaskTexture;
-        Debug.Log("[DebugMaskLinker] Успешно подписался на OnSegmentationMaskUpdated от WallSegmentation.", gameObject);
+        wallSegmentation.OnModelInitialized += HandleModelInitialized;
+        // wallSegmentation.LogPerformanceData += LogPerformanceMetrics; // Example for future use
 
         // Попытка получить начальную маску, если она уже доступна
         if (wallSegmentation.IsModelInitialized && wallSegmentation.segmentationMaskTexture != null && wallSegmentation.segmentationMaskTexture.IsCreated())
         {
             UpdateMaskTexture(wallSegmentation.segmentationMaskTexture);
-            Debug.Log("[DebugMaskLinker] Получена начальная маска от WallSegmentation.", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] Получена начальная маска от WallSegmentation.", this);
         }
         else
         {
-            Debug.LogWarning("[DebugMaskLinker] Начальная маска не доступна или модель не инициализирована при старте DebugMaskLinker. Ожидание события...", gameObject);
+            if (enableComponentLogging) Debug.LogWarning("[DebugMaskLinker] Начальная маска не доступна или модель не инициализирована при старте DebugMaskLinker. Ожидание события...", this);
+        }
+    }
+
+    private void HandleModelInitialized()
+    {
+        if (enableComponentLogging) Debug.Log("Event: WallSegmentation.OnModelInitialized received.", this);
+        // Теперь, когда модель инициализирована, можно попытаться получить маску, если она еще не была получена
+        if (rawImage.texture == null) // Если текстура все еще не установлена
+        {
+            if (wallSegmentation.TryGetLowResMask(out RenderTexture initialMask) && initialMask != null)
+            {
+                UpdateMaskTexture(initialMask);
+                if (enableComponentLogging) Debug.Log("Получена low-res маска после инициализации модели.", this);
+            }
+            else if (wallSegmentation.segmentationMaskTexture != null)
+            {
+                UpdateMaskTexture(wallSegmentation.segmentationMaskTexture);
+                if (enableComponentLogging) Debug.Log("Получена segmentationMaskTexture после инициализации модели.", this);
+            }
+            else
+            {
+                if (enableComponentLogging) Debug.LogWarning("Не удалось получить маску после HandleModelInitialized (текстуры нет).", this);
+            }
         }
     }
 
@@ -100,7 +131,7 @@ public class DebugMaskLinker : MonoBehaviour
     {
         if (rawImage == null)
         {
-            Debug.LogError("[DebugMaskLinker] RawImage компонент не найден (null) в UpdateMaskTexture. Невозможно обновить текстуру.", gameObject);
+            if (enableComponentLogging) Debug.LogError("[DebugMaskLinker] RawImage компонент не найден (null) в UpdateMaskTexture. Невозможно обновить текстуру.", this);
             return;
         }
 
@@ -111,7 +142,7 @@ public class DebugMaskLinker : MonoBehaviour
         {
             // If current material is not an instance of our custom shader, re-apply (or apply for the first time if Start failed silently for some reason)
             rawImage.material = Instantiate(customMaskDisplayMaterial);
-            Debug.Log($"[DebugMaskLinker] (UpdateMaskTexture) ПЕРЕ-назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", gameObject);
+            if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] (UpdateMaskTexture) ПЕРЕ-назначен customMaskDisplayMaterial ('{customMaskDisplayMaterial.name}') для RawImage.", this);
         }
         /* // --- OLD MATERIAL LOGIC IN UPDATE - Can be removed ---
         else if (unlitDisplayMaterial != null && (rawImage.material == null || rawImage.material.name.Contains("Default") || rawImage.material == GetDefaultUIMaterial()))
@@ -121,14 +152,14 @@ public class DebugMaskLinker : MonoBehaviour
         }
         */ // --- END OLD MATERIAL LOGIC IN UPDATE ---
 
-        Debug.Log($"[DebugMaskLinker] Получена маска в UpdateMaskTexture. IsNull: {mask == null}. Если не null, IsCreated: {(mask != null ? mask.IsCreated().ToString() : "N/A")}", gameObject);
+        if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Получена маска в UpdateMaskTexture. IsNull: {mask == null}. Если не null, IsCreated: {(mask != null ? mask.IsCreated().ToString() : "N/A")}", this);
 
         if (mask == null || !mask.IsCreated())
         {
             if (rawImage.texture != null)
             {
                 rawImage.texture = null; // Очищаем текстуру
-                Debug.LogWarning("[DebugMaskLinker] Получена невалидная/null маска, RawImage текстура очищена.", gameObject);
+                if (enableComponentLogging) Debug.LogWarning("[DebugMaskLinker] Получена невалидная/null маска, RawImage текстура очищена.", this);
             }
             // Можно также деактивировать RawImage, если маска недействительна
             // if (rawImage.gameObject.activeSelf) rawImage.gameObject.SetActive(false);
@@ -139,27 +170,27 @@ public class DebugMaskLinker : MonoBehaviour
         rawImage.texture = mask;
         rawImage.color = Color.white; // << ПРОВЕРЯЕМ, ЧТО ЦВЕТ НЕ ПРОЗРАЧНЫЙ
 
-        Debug.Log($"[DebugMaskLinker] Texture assigned to RawImage. Current texture: {(rawImage.texture != null ? rawImage.texture.name + " (InstanceID: " + rawImage.texture.GetInstanceID() + ")" : "null")}", gameObject);
+        if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Texture assigned to RawImage. Current texture: {(rawImage.texture != null ? rawImage.texture.name + " (InstanceID: " + rawImage.texture.GetInstanceID() + ")" : "null")}", this);
 
         if (rawImage.material != null)
         {
-            Debug.Log($"[DebugMaskLinker] RawImage Material: {rawImage.material.name} (Shader: {rawImage.material.shader.name})", gameObject);
+            if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] RawImage Material: {rawImage.material.name} (Shader: {rawImage.material.shader.name})", this);
         }
         else
         {
-            Debug.Log("[DebugMaskLinker] RawImage Material: None (Default UI Material)", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] RawImage Material: None (Default UI Material)", this);
         }
 
         // Убедимся, что GameObject активен, если есть текстура
         if (!rawImage.gameObject.activeSelf)
         {
             rawImage.gameObject.SetActive(true);
-            Debug.Log("[DebugMaskLinker] GameObject RawImage был неактивен, активирован.", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] GameObject RawImage был неактивен, активирован.", this);
         }
         if (!rawImage.enabled)
         {
             rawImage.enabled = true;
-            Debug.Log("[DebugMaskLinker] Компонент RawImage был выключен, включен.", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] Компонент RawImage был выключен, включен.", this);
         }
 
         // Set the mask texture to the material if it's our custom material
@@ -174,13 +205,13 @@ public class DebugMaskLinker : MonoBehaviour
             // SaveRenderTextureToFile(mask, "DebugMaskOutput_Auto.png"); // Пока закомментируем, чтобы не засорять
             // hasSavedOnce = true; // Раскомментируйте, если хотите сохранять только один раз
             // updateCounter = 0; // Сброс счетчика, если нужно периодическое сохранение
-            Debug.Log($"[DebugMaskLinker] Достигнуто {SAVE_AFTER_N_UPDATES} обновлений ({updateCounter}). Автоматическое сохранение маски DebugMaskOutput_Auto.png...", gameObject);
+            if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Достигнуто {SAVE_AFTER_N_UPDATES} обновлений ({updateCounter}). Автоматическое сохранение маски DebugMaskOutput_Auto.png...", this);
 #if UNITY_EDITOR
             // Автоматическое сохранение PNG работает только в редакторе для отладки
             SaveRenderTextureToFile(mask, "DebugMaskOutput_Auto.png");
             hasSavedOnce = true; // Сохраняем только один раз для теста
 #else
-            Debug.Log("[DebugMaskLinker] Автоматическое сохранение PNG отключено в релизной сборке для оптимизации производительности.", gameObject);
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] Автоматическое сохранение PNG отключено в релизной сборке для оптимизации производительности.", this);
             hasSavedOnce = true; // Помечаем как сохраненное, чтобы избежать повторных попыток
 #endif
         }
@@ -206,15 +237,15 @@ public class DebugMaskLinker : MonoBehaviour
         byte[] bytes = tex2D.EncodeToPNG();
         string filePath = System.IO.Path.Combine(Application.persistentDataPath, fileName); // Используем Path.Combine для корректного пути
 
-        Debug.Log($"[DebugMaskLinker] Попытка сохранить текстуру в: {filePath}", gameObject);
+        if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Попытка сохранить текстуру в: {filePath}", this);
         try
         {
             System.IO.File.WriteAllBytes(filePath, bytes);
-            Debug.Log($"[DebugMaskLinker] Текстура УСПЕШНО сохранена в {filePath}", gameObject);
+            if (enableComponentLogging) Debug.Log($"[DebugMaskLinker] Текстура УСПЕШНО сохранена в {filePath}", this);
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[DebugMaskLinker] ОШИБКА при сохранении текстуры в {filePath}: {e.Message}\n{e.StackTrace}", gameObject);
+            if (enableComponentLogging) Debug.LogError($"[DebugMaskLinker] ОШИБКА при сохранении текстуры в {filePath}: {e.Message}\n{e.StackTrace}", this);
         }
         finally // Убедимся, что tex2D уничтожается в любом случае
         {
@@ -237,7 +268,8 @@ public class DebugMaskLinker : MonoBehaviour
         if (wallSegmentation != null)
         {
             wallSegmentation.OnSegmentationMaskUpdated -= UpdateMaskTexture;
-            Debug.Log("[DebugMaskLinker] Успешно отписался от OnSegmentationMaskUpdated.", gameObject);
+            wallSegmentation.OnModelInitialized -= HandleModelInitialized;
+            if (enableComponentLogging) Debug.Log("[DebugMaskLinker] Успешно отписался от OnSegmentationMaskUpdated и OnModelInitialized.", this);
         }
     }
 }

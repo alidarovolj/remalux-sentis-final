@@ -3,7 +3,8 @@
 --- !u!78 &1
 TagManager:
   serializedVersion: 2
-  tags: []
+  tags:
+  - SceneGeometry
   layers:
   - Default
   - TransparentFX
@@ -35,8 +36,8 @@ TagManager:
   - 
   - 
   - 
-  - XR Simulation
   - 
+  - XR Simulation
   m_SortingLayers:
   - name: Default
     uniqueID: 0

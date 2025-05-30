@@ -66,24 +66,67 @@ public class SentisShapeTest : MonoBehaviour
                                     }
 
                                     // Попытка явного приведения и доступа к свойствам
-                                    Unity.Sentis.Model.Output castedOutput = null;
+                                    Unity.Sentis.Model.Output castedOutput; // Structs cannot be null initially unless nullable
+                                    bool castSuccessful = false;
+
                                     try
                                     {
-                                          castedOutput = firstOutputObj as Unity.Sentis.Model.Output;
+                                          if (firstOutputObj is Unity.Sentis.Model.Output)
+                                          {
+                                                castedOutput = (Unity.Sentis.Model.Output)firstOutputObj;
+                                                castSuccessful = true;
+                                          }
+                                          else
+                                          {
+                                                Debug.LogError($"[SentisShapeTest] firstOutputObj is of type {firstOutputObj.GetType().FullName}, not Unity.Sentis.Model.Output. Cannot cast directly.");
+                                                // Initialize to default if cast is not possible to avoid using uninitialized variable
+                                                castedOutput = default(Unity.Sentis.Model.Output);
+                                          }
                                     }
                                     catch (System.Exception castEx)
                                     {
                                           Debug.LogError($"[SentisShapeTest] Exception during cast to Unity.Sentis.Model.Output: {castEx.ToString()}");
+                                          // Initialize to default on exception
+                                          castedOutput = default(Unity.Sentis.Model.Output);
                                     }
 
-                                    if (!object.ReferenceEquals(castedOutput, null))
+                                    if (castSuccessful) // Check if the cast was successful
                                     {
                                           Debug.Log("[SentisShapeTest] Successfully cast to Unity.Sentis.Model.Output.");
                                           try
                                           {
                                                 Debug.Log($"  Name (via cast): {castedOutput.name}");
-                                                Debug.Log($"  DataType (via cast): {castedOutput.dataType}");
-                                                Debug.Log($"  Shape (via cast): {(castedOutput.shape != null ? castedOutput.shape.ToString() : "null")}");
+
+                                                // Access DataType via reflection
+                                                var dataTypeProperty = castedOutput.GetType().GetProperty("dataType");
+                                                if (dataTypeProperty != null)
+                                                {
+                                                      object dataTypeValue = dataTypeProperty.GetValue(castedOutput);
+                                                      Debug.Log($"  DataType (via reflection): {dataTypeValue}");
+                                                }
+                                                else
+                                                {
+                                                      Debug.LogWarning("  DataType property not found via reflection.");
+                                                }
+
+                                                // Access Shape via reflection
+                                                var shapeProperty = castedOutput.GetType().GetProperty("shape");
+                                                if (shapeProperty != null)
+                                                {
+                                                      object shapeValue = shapeProperty.GetValue(castedOutput);
+                                                      if (shapeValue is Unity.Sentis.TensorShape tensorShape)
+                                                      {
+                                                            Debug.Log($"  Shape (via reflection): {(tensorShape.length > 0 ? tensorShape.ToString() : "invalid/null")}");
+                                                      }
+                                                      else
+                                                      {
+                                                            Debug.LogWarning($"  Shape property is not a TensorShape (Type: {shapeValue?.GetType().FullName}). Value: {shapeValue}");
+                                                      }
+                                                }
+                                                else
+                                                {
+                                                      Debug.LogWarning("  Shape property not found via reflection.");
+                                                }
                                           }
                                           catch (System.Exception accessEx)
                                           {
@@ -92,7 +135,7 @@ public class SentisShapeTest : MonoBehaviour
                                     }
                                     else
                                     {
-                                          Debug.LogError("[SentisShapeTest] Cast to Unity.Sentis.Model.Output resulted in null.");
+                                          Debug.LogError("[SentisShapeTest] Cast to Unity.Sentis.Model.Output resulted in default.");
                                     }
                               }
                               else

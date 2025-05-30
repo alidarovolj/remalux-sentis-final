@@ -146,6 +146,106 @@ Transform:
     type: 3}
   m_PrefabInstance: {fileID: 331264285}
   m_PrefabAsset: {fileID: 0}
+--- !u!1001 &261311900
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: -3947663449533542765, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: debugFlags
+      value: -1
+      objectReference: {fileID: 0}
+    - target: {fileID: -3947663449533542765, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: planeManager
+      value: 
+      objectReference: {fileID: 331264286}
+    - target: {fileID: -3947663449533542765, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: wallSegmentationInstance
+      value: 
+      objectReference: {fileID: 1967626620}
+    - target: {fileID: -3947663449533542765, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: arManagerInitializerInstance
+      value: 
+      objectReference: {fileID: 1967626621}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalPosition.x
+      value: -12.623611
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalPosition.y
+      value: -14.849314
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalPosition.z
+      value: -15.9234705
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalRotation.w
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalRotation.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalRotation.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalRotation.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalEulerAnglesHint.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalEulerAnglesHint.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 1346551932785247038, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_LocalEulerAnglesHint.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6501323487407125107, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+        type: 3}
+      propertyPath: m_Name
+      value: ARPaintPlaneVisual
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []
+    m_RemovedGameObjects: []
+    m_AddedGameObjects: []
+    m_AddedComponents: []
+  m_SourcePrefab: {fileID: 100100000, guid: 7d9385a1cfd40418983177d9b2ceef2b, type: 3}
+--- !u!114 &261311901 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: -3947663449533542765, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+    type: 3}
+  m_PrefabInstance: {fileID: 261311900}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ea0d23777746949fd8a096933b306108, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!1001 &331264285
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -715,6 +815,7 @@ MonoBehaviour:
   unlitDisplayMaterial: {fileID: 2100000, guid: b5a14ec2309a74088908593b387f8e6f,
     type: 2}
   customMaskDisplayMaterial: {fileID: 0}
+  enableComponentLogging: 1
 --- !u!1 &1967626619
 GameObject:
   m_ObjectHideFlags: 0
@@ -727,7 +828,6 @@ GameObject:
   - component: {fileID: 1967626621}
   - component: {fileID: 1967626620}
   - component: {fileID: 1967626623}
-  - component: {fileID: 1967626624}
   - component: {fileID: 1967626625}
   m_Layer: 0
   m_Name: ARManagers
@@ -755,7 +855,7 @@ MonoBehaviour:
   modelLoadTimeout: 30
   forceXRSimulationCapture: 1
   enablePostProcessing: 1
-  enableGaussianBlur: 0
+  enableGaussianBlur: 1
   gaussianBlurMaterial: {fileID: 2100000, guid: 29d08b939f6e74a8ea2e1d83fe0744b6,
     type: 2}
   blurSize: 3
@@ -776,16 +876,18 @@ MonoBehaviour:
   targetProcessingTimeMs: 50
   qualityFactor: 0.7
   maxSegmentationFPS: 15
-  enableTemporalInterpolation: 0
+  enableTemporalInterpolation: 1
   maskInterpolationSpeed: 0.6
   useExponentialSmoothing: 1
   maxMaskAgeSeconds: 3
-  temporalBlendMaterial: {fileID: 0}
+  temporalBlendMaterial: {fileID: 2100000, guid: 5144311497fab4dea8fc872fc7763d4a,
+    type: 2}
   useSimulationIfNoCamera: 1
   failureThresholdForSimulation: 10
   arSession: {fileID: 702413258}
   xrOrigin: {fileID: 151853167}
-  segmentationMaskTexture: {fileID: 0}
+  segmentationMaskTexture: {fileID: 8400000, guid: 38610e8dfcc0545b9acc9be0bb50dfb4,
+    type: 2}
   segmentationConfidenceThreshold: 0.15
   floorConfidenceThreshold: 0.15
   modelPath: segformer-model.sentis
@@ -817,15 +919,22 @@ MonoBehaviour:
   performanceLogInterval: 5
   enableDetailedDebug: 0
   debugFlags: 399
+  enableComponentLogging: 1
+  enableDebugMaskSaving: 0
+  debugSavePath: DebugSegmentationMasks
   debugMode: 1
   debugLevel: 398
-  saveDebugMasks: 1
   useSimulatedSegmentationFallback: 1
   simulationFallbackThreshold: 10
   applyMaskSmoothing: 1
   maskBlurSize: 4
   enhanceEdges: 1
   enhanceContrast: 1
+  applyGaussianBlurToLowResMask: 1
+  applyThresholdToBlurredLowResMask: 1
+  lowResMaskThreshold: 0.5
+  quantizeModel: 1
+  wallOutputChannel: 0
 --- !u!114 &1967626621
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -838,6 +947,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6a3b4c5ac5c8d4cd59c9d184ff8fa626, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  debugFlags: 4
   xrOrigin: {fileID: 151853167}
   arCameraManager: {fileID: 751505186}
   planeManager: {fileID: 331264286}
@@ -846,14 +956,17 @@ MonoBehaviour:
   arAnchorManager: {fileID: 331264287}
   arMeshManager: {fileID: 0}
   enableSceneReconstruction: 1
-  arDirectionalLight: {fileID: 0}
-  useDetectedPlanes: 0
-  minPlaneSizeInMeters: 0.1
+  mainLight: {fileID: 1075000275}
+  useSegmentationForPlaneGeneration: 1
   minPixelsDimensionForLowResArea: 4
   minAreaSizeInLowResPixels: 16
-  wallAreaRedChannelThreshold: 128
-  enableDetailedRaycastLogging: 1
+  wallMaskRedChannelMinThreshold: 200
   maxRayDistance: 15
+  horizontalSurfaceThreshold: 0.95
+  allowNonVerticalWallPlanes: 1
+  maxCameraAngleToPlaneNormal: 75
+  planeMergeDistanceThreshold: 0.1
+  enableDetailedRaycastLogging: 1
   hitLayerMask:
     serializedVersion: 2
     m_Bits: 4294967295
@@ -861,23 +974,35 @@ MonoBehaviour:
   maxWallNormalAngleDeviation: 30
   maxFloorCeilingAngleDeviation: 15
   defaultPlaneDistance: 2.5
+  minPlaneCreationDistance: 0.3
   planeLayerName: ARPlanes
-  ignoreObjectNames: Player,UI,Hand
-  usePersistentPlanes: 1
+  ignoredObjectNames: FPSController,XR Origin,Main Camera,AR Session,AR Input Manager
+  arPaintPlanePrefab: {fileID: 6501323487407125107, guid: 7d9385a1cfd40418983177d9b2ceef2b,
+    type: 3}
+  defaultPlaneScale: {x: 0.5, y: 0.5, z: 0.01}
+  defaultPlaneWidth: 1
+  defaultPlaneHeight: 1
   highlightPersistentPlanes: 0
   persistentPlaneColor: {r: 0, g: 0.8, b: 0.2, a: 0.7}
-  verticalPlaneMaterial: {fileID: 2100000, guid: 2d8bbbe4759fb0346b0c66902365902b,
+  verticalPlaneMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa,
     type: 2}
-  horizontalPlaneMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa,
+  horizontalPlaneMaterial: {fileID: 2100000, guid: 2d8bbbe4759fb0346b0c66902365902b,
     type: 2}
-  debugRayMaterial: {fileID: 2100000, guid: 4b889361906f44446a7afbe53ad949f5, type: 2}
-  enableRaycastClustering: 1
+  drawDebugRays: 1
+  useRaycastClustering: 0
   clusteringMinHitsThreshold: 1
-  planeConfigurator: {fileID: 1967626624}
+  planeConfigurator: {fileID: 261311901}
   wallSegmentation: {fileID: 1967626620}
-  debugFlags: 4
-  selectedPlaneMaterial: {fileID: 0}
-  paintMaterial: {fileID: 0}
+  enableComponentLogging: 1
+  selectionMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa, type: 2}
+  wallPaintMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa, type: 2}
+  useDetectedPlanesForTap: 1
+  alwaysUsePhysicsRaycastForCustomPlanes: 0
+  usePhysicsRaycastForTap: 1
+  createBasicSceneGeometry: 1
+  basicSceneRoomSize: {x: 10, y: 3, z: 10}
+  basicSceneWallThickness: 0.1
+  basicSceneGeometryLayerName: SimulatedEnvironment
 --- !u!4 &1967626622
 Transform:
   m_ObjectHideFlags: 0
@@ -905,8 +1030,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9981eef26986943b4acc351a93157f9c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  segmentationProcessor: {fileID: 7200000, guid: 32a8b461d7e0c4d97ae4a1e71f61c20e,
-    type: 3}
+  postProcessShader: {fileID: 7200000, guid: 32a8b461d7e0c4d97ae4a1e71f61c20e, type: 3}
+  useComprehensiveKernel: 1
+  segmentationChannelIndex: 0
   wallThreshold: 0.5
   floorThreshold: 0.5
   edgeSoftness: 0.02
@@ -915,38 +1041,14 @@ MonoBehaviour:
   edgeGlow: 0.3
   depthInfluence: 0.5
   maxDepth: 5
-  enableDynamicQuality: 1
+  blurMaterial: {fileID: 2100000, guid: 2c70d88bbe63143cd96f655a6176fe11, type: 2}
+  thresholdMaterial: {fileID: 2100000, guid: b7f37c873e3d64dd4a33cf9554d1be69, type: 2}
+  blurSize: 3
+  binarizationThreshold: 0.5
   targetFPS: 30
---- !u!114 &1967626624
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1967626619}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ea0d23777746949fd8a096933b306108, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  planeManager: {fileID: 331264286}
-  enableVerticalPlanes: 1
-  enableHorizontalPlanes: 0
-  showDebugInfo: 1
-  improveVerticalPlaneStability: 1
-  verticalPlaneMaterial: {fileID: 2100000, guid: d5ec628d6e9f942ce99fe428f10658fa,
-    type: 2}
-  planeStabilizationDelay: 2
-  reducePlaneFlickering: 1
-  minPlaneAreaToDisplay: 0.1
-  wallSegmentationInstance: {fileID: 1967626620}
-  arManagerInitializerInstance: {fileID: 1967626621}
-  persistDetectedPlanes: 1
-  planeStabilityThreshold: 1
-  minAreaForPersistence: 0.3
-  mergeOverlapThreshold: 0.5
-  disablePlaneUpdatesAfterStabilization: 1
-  debugFlags: 0
+  fpsAverageWindow: 10
+  wallSegmentation: {fileID: 1967626620}
+  enableComponentLogging: 1
 --- !u!114 &1967626625
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1175,3 +1277,4 @@ SceneRoots:
   - {fileID: 2099970469}
   - {fileID: 331264285}
   - {fileID: 1967626622}
+  - {fileID: 261311900}
